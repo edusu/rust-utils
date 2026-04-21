@@ -5,6 +5,8 @@
 
 mod client;
 mod rate_limit;
+mod retry;
 
 pub use client::{BuildError, Client, RateLimitedClient};
 pub use rate_limit::RateLimitWindow;
+pub use retry::{HttpExecutor, RetryPolicy, RetryingClient};

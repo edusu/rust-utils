@@ -954,6 +954,7 @@ name = "rust-utils"
 version = "0.1.0"
 dependencies = [
  "governor",
+ "http",
  "reqwest",
  "tokio",
 ]

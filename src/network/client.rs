@@ -59,14 +59,7 @@ impl Client {
         }
     }
 
-    /// Return the underlying [`reqwest::Client`] so callers can build
-    /// requests with the fluent API (`.get(...)`, `.post(...)`, …).
-    ///
-    /// # Important
-    /// Sending a request through a `RequestBuilder` obtained from this
-    /// reference **bypasses the rate limiter**. For rate-limited clients
-    /// prefer [`Self::execute`] with a built [`Request`], or call
-    /// [`RateLimitedClient::wait_for_slot`] manually first.
+    /// Return the underlying [`reqwest::Client`]
     pub fn inner_client(&self) -> &ReqwestClient {
         match self {
             Client::RateLimited(c) => c.inner_client(),
@@ -77,10 +70,6 @@ impl Client {
 
 /// A [`reqwest::Client`] that paces outgoing requests through a
 /// [`governor::RateLimiter`] based on the GCRA algorithm.
-///
-/// Cloning is cheap: clones share the same limiter (via `Arc`) and the
-/// same `reqwest::Client` connection pool, so the rate limit is enforced
-/// across all of them.
 #[derive(Debug, Clone)]
 pub struct RateLimitedClient {
     inner: ReqwestClient,
