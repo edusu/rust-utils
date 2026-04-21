@@ -5,9 +5,6 @@ intended to be depended on from other Rust projects. The goal is to avoid
 re-implementing the same small pieces of plumbing (HTTP clients with rate
 limiting and retry, etc.) in every new project.
 
-Edition: **2024**. Not published to crates.io; consume as a path or git
-dependency.
-
 ## Usage
 
 ```toml
@@ -38,18 +35,18 @@ limiter.
 
 #### Rate limiting
 
-| Item | Kind | Summary |
-|------|------|---------|
-| `RateLimitWindow` | enum | Declarative time window for a rate limit: `PerSecond(n)`, `PerMinute(n)`, or `Custom { period }`. Marked `#[non_exhaustive]` so new variants can be added without breaking matches. |
-| `RateLimitedClient` | struct | `reqwest::Client` that waits on an internal `governor::RateLimiter` before every dispatch. Cheap to clone — all clones share the same limiter. |
-| `RateLimitedClient::new` | fn | Build a client using a default `reqwest::Client`. Returns `Result<Self, BuildError>`. |
-| `RateLimitedClient::with_client` | fn | Same, but on top of a user-provided `reqwest::Client` (custom timeouts, headers, TLS, …). |
-| `RateLimitedClient::execute` | async fn | Wait for a slot, then dispatch the request. |
-| `RateLimitedClient::wait_for_slot` | async fn | Block until the limiter releases a slot. Useful when driving requests through the fluent `RequestBuilder` API. |
-| `RateLimitedClient::inner_client` | fn | Access the underlying `reqwest::Client`. **Bypasses the limiter** — use with care. |
-| `Client` | enum | Thin fan-out over `RateLimited(RateLimitedClient)` and `Unrestricted(reqwest::Client)`. Lets call sites accept "any of our HTTP clients" without generics. |
-| `Client::execute` / `Client::inner_client` | fn | Delegate to the chosen variant. |
-| `BuildError` | enum | Error returned when a `RateLimitedClient` cannot be constructed (e.g. `Custom` with a zero-length period). |
+| Item                                       | Kind     | Summary                                                                                                                                                                             |
+| ------------------------------------------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `RateLimitWindow`                          | enum     | Declarative time window for a rate limit: `PerSecond(n)`, `PerMinute(n)`, or `Custom { period }`. Marked `#[non_exhaustive]` so new variants can be added without breaking matches. |
+| `RateLimitedClient`                        | struct   | `reqwest::Client` that waits on an internal `governor::RateLimiter` before every dispatch. Cheap to clone — all clones share the same limiter.                                      |
+| `RateLimitedClient::new`                   | fn       | Build a client using a default `reqwest::Client`. Returns `Result<Self, BuildError>`.                                                                                               |
+| `RateLimitedClient::with_client`           | fn       | Same, but on top of a user-provided `reqwest::Client` (custom timeouts, headers, TLS, …).                                                                                           |
+| `RateLimitedClient::execute`               | async fn | Wait for a slot, then dispatch the request.                                                                                                                                         |
+| `RateLimitedClient::wait_for_slot`         | async fn | Block until the limiter releases a slot. Useful when driving requests through the fluent `RequestBuilder` API.                                                                      |
+| `RateLimitedClient::inner_client`          | fn       | Access the underlying `reqwest::Client`. **Bypasses the limiter** — use with care.                                                                                                  |
+| `Client`                                   | enum     | Thin fan-out over `RateLimited(RateLimitedClient)` and `Unrestricted(reqwest::Client)`. Lets call sites accept "any of our HTTP clients" without generics.                          |
+| `Client::execute` / `Client::inner_client` | fn       | Delegate to the chosen variant.                                                                                                                                                     |
+| `BuildError`                               | enum     | Error returned when a `RateLimitedClient` cannot be constructed (e.g. `Custom` with a zero-length period).                                                                          |
 
 Example:
 
@@ -68,20 +65,20 @@ let response = client.execute(request).await?;
 
 #### Retry
 
-| Item | Kind | Summary |
-|------|------|---------|
-| `HttpExecutor` | trait | Abstraction over anything that can execute a `reqwest::Request`. Implemented for `reqwest::Client`, `Client`, `RateLimitedClient` and `RetryingClient` — which is what lets layers be stacked and enables mocking in tests. |
-| `RetryPolicy` | struct | Declarative retry configuration (max attempts, retriable statuses, network-error handling, idempotency rules, backoff, jitter). Built with fluent setters on top of `Default::default()`. Private fields, so new options can be added without breaking callers. |
-| `RetryPolicy::max_attempts` | fn | Total number of attempts (initial + retries). Takes `NonZeroU32`. |
-| `RetryPolicy::retry_statuses` | fn | Replace the set of response statuses that trigger a retry. Defaults to `429` and `503`. |
-| `RetryPolicy::retry_network_errors` | fn | Toggle retry on connect/timeout errors. Default `true`. |
-| `RetryPolicy::retry_non_idempotent` | fn | Opt in to retrying `POST`/`PATCH`. Default `false` (avoids duplicated side effects). |
-| `RetryPolicy::base_backoff` / `max_backoff` | fn | Exponential backoff parameters: `base * 2^(attempt-1)`, capped by `max_backoff`. The cap also bounds server-sent `Retry-After` values. |
-| `RetryPolicy::jitter` | fn | Enable or disable full jitter (`[0, computed]`) on the computed backoff. |
-| `RetryingClient<E>` | struct | Wraps any `HttpExecutor` and retries according to a `RetryPolicy`. Also implements `HttpExecutor`, so layers can be stacked. |
-| `RetryingClient::new` | fn | Wrap an executor with a policy. |
-| `RetryingClient::execute` | async fn | Send the request; on retriable failures, replay it respecting `Retry-After` or exponential backoff. Always returns the last observed result — a request that exhausts retries on a retriable status still yields `Ok(response)` so the caller can inspect it. |
-| `RetryingClient::inner` / `policy` | fn | Accessors for the wrapped executor and the active policy. |
+| Item                                        | Kind     | Summary                                                                                                                                                                                                                                                         |
+| ------------------------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `HttpExecutor`                              | trait    | Abstraction over anything that can execute a `reqwest::Request`. Implemented for `reqwest::Client`, `Client`, `RateLimitedClient` and `RetryingClient` — which is what lets layers be stacked and enables mocking in tests.                                     |
+| `RetryPolicy`                               | struct   | Declarative retry configuration (max attempts, retriable statuses, network-error handling, idempotency rules, backoff, jitter). Built with fluent setters on top of `Default::default()`. Private fields, so new options can be added without breaking callers. |
+| `RetryPolicy::max_attempts`                 | fn       | Total number of attempts (initial + retries). Takes `NonZeroU32`.                                                                                                                                                                                               |
+| `RetryPolicy::retry_statuses`               | fn       | Replace the set of response statuses that trigger a retry. Defaults to `429` and `503`.                                                                                                                                                                         |
+| `RetryPolicy::retry_network_errors`         | fn       | Toggle retry on connect/timeout errors. Default `true`.                                                                                                                                                                                                         |
+| `RetryPolicy::retry_non_idempotent`         | fn       | Opt in to retrying `POST`/`PATCH`. Default `false` (avoids duplicated side effects).                                                                                                                                                                            |
+| `RetryPolicy::base_backoff` / `max_backoff` | fn       | Exponential backoff parameters: `base * 2^(attempt-1)`, capped by `max_backoff`. The cap also bounds server-sent `Retry-After` values.                                                                                                                          |
+| `RetryPolicy::jitter`                       | fn       | Enable or disable full jitter (`[0, computed]`) on the computed backoff.                                                                                                                                                                                        |
+| `RetryingClient<E>`                         | struct   | Wraps any `HttpExecutor` and retries according to a `RetryPolicy`. Also implements `HttpExecutor`, so layers can be stacked.                                                                                                                                    |
+| `RetryingClient::new`                       | fn       | Wrap an executor with a policy.                                                                                                                                                                                                                                 |
+| `RetryingClient::execute`                   | async fn | Send the request; on retriable failures, replay it respecting `Retry-After` or exponential backoff. Always returns the last observed result — a request that exhausts retries on a retriable status still yields `Ok(response)` so the caller can inspect it.   |
+| `RetryingClient::inner` / `policy`          | fn       | Accessors for the wrapped executor and the active policy.                                                                                                                                                                                                       |
 
 Notes:
 
