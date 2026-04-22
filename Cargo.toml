@@ -3,10 +3,19 @@ name = "rust-utils"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Opt-in OS-signal integration for `concurrency::shutdown`. Enables the
+# `trigger_on_signal` helper, which spawns a background task that
+# listens for SIGINT / SIGTERM (Unix) or Ctrl+C (Windows) and triggers
+# graceful shutdown. Off by default so consumers that do not need it
+# (libraries, tests) do not pull in tokio's signal machinery.
+signal = ["tokio/signal"]
+
 [dependencies]
 reqwest = "0.12"
 governor = "0.7"
 tokio = { version = "1", default-features = false, features = ["time", "sync", "rt"] }
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 thiserror = "2"
 error-stack = "0.5"
 async-nats = { version = "0.47", default-features = false, features = ["server_2_10", "ring"] }

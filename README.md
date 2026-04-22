@@ -272,6 +272,25 @@ Concurrency utilities built on top of the `tokio` runtime.
 | `Throttle::try_run`         | async fn | Run the supplied closure if the window allows it and return `Some(result)`; otherwise return `None` without invoking the closure.                                                               |
 | `Throttle::reset`           | fn       | Forget the last-run timestamp; the next call runs immediately.                                                                                                                                  |
 | `Throttle::min_interval`    | fn       | Accessor for the configured window.                                                                                                                                                             |
+| `ShutdownController`                    | struct   | Graceful-shutdown coordinator that bundles a `tokio_util::sync::CancellationToken` with a `tokio_util::task::TaskTracker`. `Clone`-cheap (both primitives are refcounted); every clone shares the same cancellation state and contributes to the same task set. |
+| `ShutdownController::new` / `default`   | fn       | Build a fresh controller with an un-cancelled token and an empty tracker.                                                                                                                       |
+| `ShutdownController::token`             | fn       | Clone of the internal `CancellationToken` — hand it to workers so they can `select!` on `token.cancelled()`.                                                                                    |
+| `ShutdownController::tracker`           | fn       | Clone of the internal `TaskTracker` for callers that want to spawn/track tasks through the `TaskTracker` API directly.                                                                          |
+| `ShutdownController::spawn`             | fn       | Convenience: `tokio::spawn` a future and track it under this controller. Panics if called outside a Tokio runtime.                                                                              |
+| `ShutdownController::trigger`           | fn       | Cancel the token so cooperating workers wind down. Idempotent.                                                                                                                                  |
+| `ShutdownController::is_shutdown`       | fn       | Whether `trigger` (or an equivalent on a clone) has been called.                                                                                                                                |
+| `ShutdownController::shutdown`          | async fn | Trigger, close the tracker, and await every tracked task bounded by a timeout. Returns `UtilsResult<()>`; a timeout surfaces as `UtilsError::Concurrency` with the count of still-running tasks attached. |
+| `ShutdownController::trigger_on_signal` | fn       | Feature-gated (`signal`). Spawns a tracked listener that triggers shutdown on `SIGINT`/`SIGTERM` (Unix) or Ctrl+C (Windows).                                                                    |
+| `Supervisor`                            | struct   | Restart-policy loop for a long-running Tokio task. Catches panics via `JoinSet`, reclassifies them, and restarts with exponential backoff + optional full jitter. Cooperative shutdown via `CancellationToken` — the token is handed to every restarted instance. |
+| `Supervisor::new` / `default`           | fn       | Build with the default policy: unlimited restarts, 200ms base backoff, 30s cap, jitter on, restart on Ok/Err/panic.                                                                             |
+| `Supervisor::name`                      | fn       | Optional label emitted by `tracing` events from the supervision loop.                                                                                                                           |
+| `Supervisor::max_restarts`              | fn       | Cap on the number of restarts before giving up. Takes `NonZeroU32`.                                                                                                                             |
+| `Supervisor::restart_window`            | fn       | Rolling time window for the restart counter — only restarts within the window count towards the cap, so sporadic failures do not exhaust the budget the way a crash-loop does.                 |
+| `Supervisor::base_backoff` / `max_backoff` | fn    | Exponential backoff between restarts: `base * 2^(consecutive-1)` capped at `max_backoff`.                                                                                                       |
+| `Supervisor::jitter`                    | fn       | Enable or disable full jitter (`[0, computed]`) on the backoff. Default `true` — desynchronises crash-looping replicas.                                                                         |
+| `Supervisor::restart_on_ok`             | fn       | Whether to restart when the task returns `Ok(())`. Default `true`.                                                                                                                              |
+| `Supervisor::restart_on_panic`          | fn       | Whether to restart when the task panics. Default `true`. When disabled, a panic terminates the supervisor with `UtilsError::Concurrency`.                                                       |
+| `Supervisor::run`                       | async fn | Drive the loop. Takes a `CancellationToken` (cloned into every restarted instance) and a factory `Fn(CancellationToken) -> Fut`. Returns `UtilsResult<()>`; budget exhaustion surfaces as `UtilsError::RetryExhausted` with the last error chained in. |
 
 `WorkerPool` vs. `Throttle`: the pool runs *every* submitted job and paces
 by slot availability, while the throttle deliberately drops calls to
@@ -304,6 +323,80 @@ let throttle = Throttle::new(Duration::from_millis(500));
 assert!(throttle.try_run(|| async { 1 }).await.is_some()); // runs
 assert!(throttle.try_run(|| async { 2 }).await.is_none()); // dropped
 ```
+
+Example — graceful shutdown:
+
+```rust,no_run
+use std::time::Duration;
+use rust_utils::concurrency::ShutdownController;
+
+# async fn run() -> rust_utils::UtilsResult<()> {
+let controller = ShutdownController::new();
+
+// Spawn a cooperating worker that exits when cancellation fires.
+let token = controller.token();
+controller.spawn(async move {
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => break,
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                // … periodic work …
+            }
+        }
+    }
+});
+
+// With the `signal` feature enabled, a single call wires SIGINT/SIGTERM
+// to `trigger()`; without it, call `controller.trigger()` yourself when
+// the process decides to stop.
+# #[cfg(feature = "signal")]
+controller.trigger_on_signal();
+
+// Trigger shutdown and wait for in-flight work, bounded by a timeout.
+// A timeout surfaces as `UtilsError::Concurrency` with the count of
+// still-running tasks attached.
+controller.shutdown(Duration::from_secs(30)).await?;
+# Ok(())
+# }
+```
+
+Example — supervise a long-running task:
+
+```rust,no_run
+use std::num::NonZeroU32;
+use std::time::Duration;
+use rust_utils::concurrency::{ShutdownController, Supervisor};
+
+# async fn run() -> rust_utils::UtilsResult<()> {
+let ctrl = ShutdownController::new();
+let token = ctrl.token();
+
+// Supervise a subscriber loop. If it exits (error, panic, or clean
+// return) the supervisor restarts it with exponential backoff until
+// either the budget is exhausted or shutdown is triggered.
+ctrl.spawn(async move {
+    let _ = Supervisor::new()
+        .name("nats-subscriber")
+        .max_restarts(NonZeroU32::new(10).unwrap())
+        .restart_window(Duration::from_secs(60))
+        .base_backoff(Duration::from_millis(200))
+        .max_backoff(Duration::from_secs(30))
+        .run(token, |tok| async move {
+            // Run the service; observe `tok` for cooperative shutdown.
+            let _ = tok;
+            Ok(())
+        })
+        .await;
+});
+# Ok(())
+# }
+```
+
+## Feature flags
+
+| Flag     | What it enables                                                                                                                                            |
+| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `signal` | `ShutdownController::trigger_on_signal`, which spawns a tracked task that triggers shutdown on `SIGINT`/`SIGTERM` (Unix) or Ctrl+C (Windows). Off by default. |
 
 ## Commands
 
