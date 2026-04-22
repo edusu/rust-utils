@@ -160,6 +160,13 @@ impl NatsClient {
     /// Subscribe to `subject` and process each incoming message
     /// concurrently via `handler`.
     ///
+    /// When [`SubscriptionConfig::queue_group`] is `Some`, the
+    /// underlying subscription is a **queue subscribe** — multiple
+    /// subscribers sharing that group name will have messages
+    /// load-balanced among them by the server, instead of each
+    /// receiving a copy. See [`SubscriptionConfig`] for the full
+    /// semantics.
+    ///
     /// Each message is:
     /// 1. **Size-checked** against
     ///    [`SubscriptionConfig::max_payload_bytes`] — oversized
@@ -210,12 +217,35 @@ impl NatsClient {
         Fut: Future<Output = UtilsResult<Resp>> + Send + 'static,
     {
         let subject_name = subject.into();
-        let subscriber = self
-            .client
-            .subscribe(subject_name.clone())
-            .await
-            .change_context(UtilsError::Network)
-            .attach_printable_lazy(|| format!("nats subject: {subject_name}"))?;
+        // Destructure once so we can move `queue_group` (a `String`)
+        // out of the config without cloning, while still reading the
+        // other two fields as plain values.
+        let SubscriptionConfig {
+            max_concurrency,
+            max_payload_bytes,
+            queue_group,
+        } = config;
+
+        // Queue subscribe vs plain subscribe is decided here: the
+        // only difference on the wire is whether the SUB frame
+        // carries a queue-group name, so the downstream pipeline is
+        // identical either way.
+        let subscriber = match queue_group {
+            Some(group) => self
+                .client
+                .queue_subscribe(subject_name.clone(), group.clone())
+                .await
+                .change_context(UtilsError::Network)
+                .attach_printable_lazy(|| {
+                    format!("nats subject: {subject_name} (queue group: {group})")
+                })?,
+            None => self
+                .client
+                .subscribe(subject_name.clone())
+                .await
+                .change_context(UtilsError::Network)
+                .attach_printable_lazy(|| format!("nats subject: {subject_name}"))?,
+        };
 
         // Shared state moved into the concurrent stream handler. The
         // client is cheap to clone (refcounted); the handler and the
@@ -225,11 +255,10 @@ impl NatsClient {
         let client = self.client.clone();
         let handler = Arc::new(handler);
         let subject_name = Arc::new(subject_name);
-        let max_payload_bytes = config.max_payload_bytes;
-        let concurrency = if config.max_concurrency == 0 {
+        let concurrency = if max_concurrency == 0 {
             None
         } else {
-            Some(config.max_concurrency)
+            Some(max_concurrency)
         };
 
         subscriber

@@ -84,8 +84,21 @@ impl NatsConnectOptions {
 /// Runtime configuration for a single subscription served by
 /// [`NatsClient::serve_request_reply`](super::NatsClient::serve_request_reply).
 ///
-/// Defaults: 16 concurrent handlers, 1 MiB per-message payload cap.
-#[derive(Debug, Clone, Copy)]
+/// Defaults: 16 concurrent handlers, 1 MiB per-message payload cap,
+/// no queue group (plain fan-out subscribe).
+///
+/// # Queue groups (load-balancing)
+/// When [`queue_group`](Self::queue_group) is `Some(name)`, the
+/// subscription joins the named **queue group** on the NATS server:
+/// every message published to the subject is delivered to **exactly
+/// one** member of the group, chosen by the server. Multiple
+/// subscribers sharing the same group therefore load-balance work;
+/// subscribers **outside** the group (including other groups on the
+/// same subject) still receive their own copy independently.
+///
+/// Queue groups are a subscriber-side concern only — publishers are
+/// unaware of whether their messages are fanned out or balanced.
+#[derive(Debug, Clone)]
 pub struct SubscriptionConfig {
     /// Maximum number of messages processed concurrently. A value
     /// of `0` disables the cap (unbounded fan-out).
@@ -94,15 +107,31 @@ pub struct SubscriptionConfig {
     /// discarded (logged at `warn` level) so a single oversized
     /// message cannot OOM the worker.
     pub max_payload_bytes: usize,
+    /// Optional queue-group name. `None` subscribes plainly (every
+    /// subscriber on the subject gets a copy); `Some(name)` joins the
+    /// queue group so messages are load-balanced across members.
+    pub queue_group: Option<String>,
 }
 
 impl SubscriptionConfig {
-    /// Build a config with explicit values.
+    /// Build a config with explicit concurrency / payload values and
+    /// no queue group. Use [`Self::queue_group`] to opt into
+    /// load-balancing.
     pub const fn new(max_concurrency: usize, max_payload_bytes: usize) -> Self {
         Self {
             max_concurrency,
             max_payload_bytes,
+            queue_group: None,
         }
+    }
+
+    /// Join the named queue group so messages delivered to the
+    /// subject are load-balanced across all subscribers that share
+    /// this group name (see the type-level docs for the exact
+    /// semantics).
+    pub fn queue_group(mut self, name: impl Into<String>) -> Self {
+        self.queue_group = Some(name.into());
+        self
     }
 }
 
@@ -111,6 +140,7 @@ impl Default for SubscriptionConfig {
         Self {
             max_concurrency: 16,
             max_payload_bytes: 1024 * 1024,
+            queue_group: None,
         }
     }
 }
