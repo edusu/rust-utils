@@ -57,7 +57,6 @@ use std::num::NonZeroU32;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use error_stack::Report;
-use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{UtilsError, UtilsResult};
@@ -208,15 +207,11 @@ impl Supervisor {
             }
 
             let run_started_at = Instant::now();
-            let fut = factory(token.clone());
 
-            // Use a JoinSet so panics surface as `JoinError` rather
-            // than unwinding the supervising task.
-            let mut set = JoinSet::new();
-            set.spawn(fut);
-            // `set` was just populated with one task, so
-            // `join_next().await` yields `Some(...)`.
-            let outcome = set.join_next().await.expect("just spawned one task");
+            // Spawn the supervised future on its own Tokio task so a
+            // panic inside it surfaces as a `JoinError` instead of
+            // unwinding the supervisor itself.
+            let outcome = tokio::spawn(factory(token.clone())).await;
 
             if token.is_cancelled() {
                 // Shutdown in progress: stop supervising even if the
