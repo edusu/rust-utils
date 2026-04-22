@@ -21,3 +21,40 @@ pub enum RateLimitWindow {
     /// strictly greater than zero.
     Custom { period: Duration },
 }
+
+impl RateLimitWindow {
+    /// - `<n>s` → PerSecond(n)
+    /// - `<n>m` → PerMinute(n)
+    /// - `<n>h` → Custom { period = Duration::from_secs(n * 3600) }
+    /// - `<n>d` → Custom { period = Duration::from_secs(n * 86400) }
+    pub fn from_string(s: &str) -> Option<Self> {
+        if s.is_empty() {
+            return None;
+        }
+
+        let (num_str, unit) = s.split_at(s.len() - 1);
+        let number: u32 = match num_str.parse() {
+            Ok(n) if n > 0 => n,
+            _ => return None,
+        };
+        let nonzero = NonZeroU32::new(number)?;
+
+        match unit {
+            "s" => Some(RateLimitWindow::PerSecond(nonzero)),
+            "m" => Some(RateLimitWindow::PerMinute(nonzero)),
+            "h" => {
+                let secs = number as u64 * 3600;
+                Some(RateLimitWindow::Custom {
+                    period: Duration::from_secs(secs),
+                })
+            }
+            "d" => {
+                let secs = number as u64 * 86400;
+                Some(RateLimitWindow::Custom {
+                    period: Duration::from_secs(secs),
+                })
+            }
+            _ => None,
+        }
+    }
+}

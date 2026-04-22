@@ -1,36 +1,21 @@
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+use error_stack::Report;
 use governor::clock::DefaultClock;
 use governor::middleware::NoOpMiddleware;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
-use reqwest::{Client as ReqwestClient, Error as ReqwestError, Request, Response};
+use reqwest::{Client as ReqwestClient, Request, Response};
 
 use super::rate_limit::RateLimitWindow;
+use crate::error::{UtilsError, UtilsResult};
 
 /// Concrete type of the in-memory, direct, non-keyed limiter used here.
 ///
 /// Pulled out as an alias because the four type parameters of
 /// `RateLimiter` turn every signature into noise.
 type DirectLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>;
-
-/// Error returned when a [`RateLimitedClient`] cannot be constructed.
-#[derive(Debug)]
-pub enum BuildError {
-    /// The configured period was zero, which `governor::Quota` rejects.
-    ZeroPeriod,
-}
-
-impl std::fmt::Display for BuildError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ZeroPeriod => f.write_str("rate limit period must be non-zero"),
-        }
-    }
-}
-
-impl std::error::Error for BuildError {}
 
 /// HTTP client that wraps [`reqwest::Client`] and optionally paces
 /// outgoing requests through an internal rate limiter.
@@ -52,10 +37,18 @@ impl Client {
     ///
     /// For the [`Self::RateLimited`] variant this first awaits the
     /// limiter and only then dispatches the request.
-    pub async fn execute(&self, req: Request) -> Result<Response, ReqwestError> {
+    ///
+    /// # Errors
+    /// Returns a [`UtilsError::Network`] report for connect/timeout
+    /// failures and [`UtilsError::Http`] for any other transport-level
+    /// failure. The original `reqwest::Error` is attached to the
+    /// report for inspection/logging.
+    pub async fn execute(&self, req: Request) -> UtilsResult<Response> {
         match self {
             Client::RateLimited(c) => c.execute(req).await,
-            Client::Unrestricted(c) => c.execute(req).await,
+            Client::Unrestricted(c) => {
+                c.execute(req).await.map_err(into_network_or_http)
+            }
         }
     }
 
@@ -83,14 +76,12 @@ impl RateLimitedClient {
     /// # Arguments
     /// * `window` — how often cells are replenished.
     /// * `burst`  — maximum bucket size. When `None`, `governor`'s
-    ///   default for the window is used (for [`RateLimitWindow::Custom`]
-    ///   that is one cell; for the `PerSecond`/`PerMinute` variants the
-    ///   burst defaults to `allowed`).
+    ///   default for the window is used.
     ///
     /// # Errors
-    /// Returns [`BuildError::ZeroPeriod`] when `window` is
+    /// Returns [`UtilsError::Config`] when `window` is
     /// [`RateLimitWindow::Custom`] with a zero-length duration.
-    pub fn new(window: RateLimitWindow, burst: Option<NonZeroU32>) -> Result<Self, BuildError> {
+    pub fn new(window: RateLimitWindow, burst: Option<NonZeroU32>) -> UtilsResult<Self> {
         Self::with_client(ReqwestClient::new(), window, burst)
     }
 
@@ -107,15 +98,16 @@ impl RateLimitedClient {
         inner: ReqwestClient,
         window: RateLimitWindow,
         burst: Option<NonZeroU32>,
-    ) -> Result<Self, BuildError> {
+    ) -> UtilsResult<Self> {
         // Translate the high-level window into a `governor::Quota`.
         // `with_period` is the only path that can fail (period == 0).
         let mut quota = match window {
             RateLimitWindow::PerSecond(allowed) => Quota::per_second(allowed),
             RateLimitWindow::PerMinute(allowed) => Quota::per_minute(allowed),
-            RateLimitWindow::Custom { period } => {
-                Quota::with_period(period).ok_or(BuildError::ZeroPeriod)?
-            }
+            RateLimitWindow::Custom { period } => Quota::with_period(period).ok_or_else(|| {
+                Report::new(UtilsError::Config)
+                    .attach_printable("rate limit period must be non-zero")
+            })?,
         };
         if let Some(b) = burst {
             quota = quota.allow_burst(b);
@@ -128,30 +120,41 @@ impl RateLimitedClient {
 
     /// Reference to the underlying [`reqwest::Client`].
     ///
-    /// See the caveat on [`Client::inner_client`]: requests dispatched
-    /// directly through this handle bypass the rate limiter.
+    /// Requests dispatched directly through this handle bypass the rate
+    /// limiter.
     pub fn inner_client(&self) -> &ReqwestClient {
         &self.inner
     }
 
     /// Wait until the rate limiter releases a slot, then return.
-    ///
-    /// Exposed publicly so callers that prefer the `RequestBuilder`
-    /// fluent style can still respect the configured rate limit:
-    ///
-    /// ```ignore
-    /// client.wait_for_slot().await;
-    /// let resp = client.inner_client().get(url).send().await?;
-    /// ```
     pub async fn wait_for_slot(&self) {
         self.limiter.until_ready().await;
     }
 
     /// Await a slot from the limiter and then dispatch the request.
-    pub async fn execute(&self, req: Request) -> Result<Response, ReqwestError> {
+    ///
+    /// # Errors
+    /// Same classification as [`Client::execute`].
+    pub async fn execute(&self, req: Request) -> UtilsResult<Response> {
         self.wait_for_slot().await;
-        self.inner.execute(req).await
+        self.inner.execute(req).await.map_err(into_network_or_http)
     }
+}
+
+/// Classify a `reqwest::Error` into the crate's error taxonomy.
+///
+/// Connect/timeout failures are [`UtilsError::Network`]; everything
+/// else produced by `reqwest::Client::execute` (builder, redirect,
+/// body, decode) is classified as [`UtilsError::Http`]. The original
+/// `reqwest::Error` is attached as the root context so the source
+/// chain remains reachable via the resulting report.
+pub(crate) fn into_network_or_http(e: reqwest::Error) -> Report<UtilsError> {
+    let kind = if e.is_connect() || e.is_timeout() {
+        UtilsError::Network
+    } else {
+        UtilsError::Http
+    };
+    Report::new(e).change_context(kind)
 }
 
 #[cfg(test)]
@@ -189,7 +192,7 @@ mod tests {
     /// time rather than panicking inside `governor`.
     #[test]
     fn custom_zero_period_is_rejected() {
-        let err = RateLimitedClient::new(
+        let report = RateLimitedClient::new(
             RateLimitWindow::Custom {
                 period: Duration::ZERO,
             },
@@ -197,7 +200,7 @@ mod tests {
         )
         .expect_err("zero-length period must be rejected");
 
-        assert!(matches!(err, BuildError::ZeroPeriod));
+        assert!(matches!(report.current_context(), UtilsError::Config));
     }
 
     /// Clones must share the same limiter: draining the burst on one

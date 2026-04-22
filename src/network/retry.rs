@@ -10,15 +10,23 @@
 //! orthogonal lets callers pick the combination they need. Typical
 //! stacking order is `Retry` → `RateLimit` → `reqwest::Client` so that
 //! every retry also costs a cell in the internal rate limiter.
+//!
+//! # Error surface
+//! Both the trait and the wrapper return [`UtilsResult<Response>`]. The
+//! retry loop matches on the current context of the attached report
+//! ([`UtilsError::Network`] for transport failures, anything else is
+//! treated as a non-retryable HTTP failure) instead of poking at
+//! `reqwest::Error` directly.
 
 use std::future::Future;
 use std::num::NonZeroU32;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::header::RETRY_AFTER;
-use reqwest::{Error as ReqwestError, Method, Request, Response, StatusCode};
+use reqwest::{Method, Request, Response, StatusCode};
 
-use super::client::{Client, RateLimitedClient};
+use super::client::{Client, RateLimitedClient, into_network_or_http};
+use crate::error::{UtilsError, UtilsResult};
 
 /// Abstraction over anything capable of executing a
 /// [`reqwest::Request`].
@@ -32,35 +40,25 @@ use super::client::{Client, RateLimitedClient};
 /// be used on multi-threaded async runtimes.
 pub trait HttpExecutor: Send + Sync {
     /// Send the request and await its response.
-    fn execute(
-        &self,
-        req: Request,
-    ) -> impl Future<Output = Result<Response, ReqwestError>> + Send;
+    fn execute(&self, req: Request) -> impl Future<Output = UtilsResult<Response>> + Send;
 }
 
 impl HttpExecutor for reqwest::Client {
-    fn execute(
-        &self,
-        req: Request,
-    ) -> impl Future<Output = Result<Response, ReqwestError>> + Send {
+    async fn execute(&self, req: Request) -> UtilsResult<Response> {
         reqwest::Client::execute(self, req)
+            .await
+            .map_err(into_network_or_http)
     }
 }
 
 impl HttpExecutor for RateLimitedClient {
-    fn execute(
-        &self,
-        req: Request,
-    ) -> impl Future<Output = Result<Response, ReqwestError>> + Send {
+    fn execute(&self, req: Request) -> impl Future<Output = UtilsResult<Response>> + Send {
         RateLimitedClient::execute(self, req)
     }
 }
 
 impl HttpExecutor for Client {
-    fn execute(
-        &self,
-        req: Request,
-    ) -> impl Future<Output = Result<Response, ReqwestError>> + Send {
+    fn execute(&self, req: Request) -> impl Future<Output = UtilsResult<Response>> + Send {
         Client::execute(self, req)
     }
 }
@@ -195,7 +193,7 @@ impl<E: HttpExecutor> RetryingClient<E> {
     /// A retryable status code that still exhausts `max_attempts`
     /// comes back as `Ok(response)`, not as an error; inspect
     /// [`Response::status`] to decide what to do.
-    pub async fn execute(&self, req: Request) -> Result<Response, ReqwestError> {
+    pub async fn execute(&self, req: Request) -> UtilsResult<Response> {
         // Template cloned once, re-cloned per retry. `None` means the
         // body is not replayable (e.g. streaming), so we won't retry.
         let template = req.try_clone();
@@ -219,17 +217,16 @@ impl<E: HttpExecutor> RetryingClient<E> {
     }
 
     /// Whether the last result qualifies for another attempt.
-    fn should_retry(
-        &self,
-        result: &Result<Response, ReqwestError>,
-        method: &Method,
-    ) -> bool {
+    fn should_retry(&self, result: &UtilsResult<Response>, method: &Method) -> bool {
         if !self.policy.retry_non_idempotent && !is_idempotent(method) {
             return false;
         }
         match result {
             Ok(resp) => self.policy.retry_statuses.contains(&resp.status()),
-            Err(e) => self.policy.retry_network_errors && is_network_error(e),
+            Err(report) => {
+                self.policy.retry_network_errors
+                    && matches!(report.current_context(), UtilsError::Network)
+            }
         }
     }
 
@@ -238,11 +235,7 @@ impl<E: HttpExecutor> RetryingClient<E> {
     /// A server-sent `Retry-After` header takes precedence (capped by
     /// `max_backoff`). Otherwise exponential backoff is used, with
     /// full jitter when enabled.
-    fn compute_delay(
-        &self,
-        attempt: u32,
-        result: &Result<Response, ReqwestError>,
-    ) -> Duration {
+    fn compute_delay(&self, attempt: u32, result: &UtilsResult<Response>) -> Duration {
         if let Ok(resp) = result
             && let Some(server_delay) = parse_retry_after(resp)
         {
@@ -260,10 +253,7 @@ impl<E: HttpExecutor> RetryingClient<E> {
 }
 
 impl<E: HttpExecutor> HttpExecutor for RetryingClient<E> {
-    fn execute(
-        &self,
-        req: Request,
-    ) -> impl Future<Output = Result<Response, ReqwestError>> + Send {
+    fn execute(&self, req: Request) -> impl Future<Output = UtilsResult<Response>> + Send {
         RetryingClient::execute(self, req)
     }
 }
@@ -279,15 +269,6 @@ fn is_idempotent(method: &Method) -> bool {
             | Method::OPTIONS
             | Method::TRACE
     )
-}
-
-/// Classify a `reqwest::Error` as a retryable network error.
-///
-/// Intentionally narrow: only connect failures and timeouts. Builder,
-/// body, decode and redirect errors either cannot be retried safely
-/// or will not be fixed by retrying.
-fn is_network_error(e: &ReqwestError) -> bool {
-    e.is_connect() || e.is_timeout()
 }
 
 /// Parse the `Retry-After` header as an integer number of seconds.
@@ -319,12 +300,14 @@ fn full_jitter(capped: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use error_stack::Report;
     use std::sync::Mutex;
 
     /// Scripted response kinds consumed by `MockExecutor`.
     enum ResponseKind {
         Status(StatusCode),
         WithRetryAfter { status: StatusCode, seconds: u64 },
+        NetworkError,
     }
 
     /// Test-only executor that returns responses from a pre-loaded queue
@@ -351,7 +334,7 @@ mod tests {
         fn execute(
             &self,
             _req: Request,
-        ) -> impl Future<Output = Result<Response, ReqwestError>> + Send {
+        ) -> impl Future<Output = UtilsResult<Response>> + Send {
             // Pop the next scripted response synchronously so the lock
             // never crosses an await point.
             let kind = {
@@ -364,19 +347,31 @@ mod tests {
                     .expect("MockExecutor ran out of scripted responses")
             };
 
-            let (status, retry_after) = match kind {
-                ResponseKind::Status(s) => (s, None),
-                ResponseKind::WithRetryAfter { status, seconds } => (status, Some(seconds)),
-            };
-            let mut builder = http::Response::builder().status(status);
-            if let Some(seconds) = retry_after {
-                builder = builder.header("retry-after", seconds.to_string());
+            async move {
+                match kind {
+                    ResponseKind::NetworkError => {
+                        Err(Report::new(UtilsError::Network)
+                            .attach_printable("scripted network failure"))
+                    }
+                    other => {
+                        let (status, retry_after) = match other {
+                            ResponseKind::Status(s) => (s, None),
+                            ResponseKind::WithRetryAfter { status, seconds } => {
+                                (status, Some(seconds))
+                            }
+                            ResponseKind::NetworkError => unreachable!(),
+                        };
+                        let mut builder = http::Response::builder().status(status);
+                        if let Some(seconds) = retry_after {
+                            builder = builder.header("retry-after", seconds.to_string());
+                        }
+                        let http_resp = builder
+                            .body(Vec::<u8>::new())
+                            .expect("static response must build");
+                        Ok(Response::from(http_resp))
+                    }
+                }
             }
-            let http_resp = builder
-                .body(Vec::<u8>::new())
-                .expect("static response must build");
-            let resp = Response::from(http_resp);
-            async move { Ok(resp) }
         }
     }
 
@@ -499,6 +494,23 @@ mod tests {
         let resp = client.execute(req(Method::GET, "http://x/")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(client.inner().call_count(), 1);
+    }
+
+    /// A scripted `UtilsError::Network` should be retried until the
+    /// policy either succeeds or exhausts its budget.
+    #[tokio::test]
+    async fn retries_on_network_error_context() {
+        let mock = MockExecutor::new(vec![
+            ResponseKind::NetworkError,
+            ResponseKind::Status(StatusCode::OK),
+        ]);
+        let client = RetryingClient::new(
+            mock,
+            fast_policy().max_attempts(NonZeroU32::new(3).unwrap()),
+        );
+        let resp = client.execute(req(Method::GET, "http://x/")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(client.inner().call_count(), 2);
     }
 
     #[test]
