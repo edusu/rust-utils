@@ -72,8 +72,7 @@ impl<T: Send + 'static> WorkerPool<T> {
     {
         // Box and type-erase the handler so the pool's type stays
         // independent of the concrete `Fut` returned by the closure.
-        let handler: Handler<T> =
-            Arc::new(move |job: T| Box::pin(handler(job)) as BoxedFuture);
+        let handler: Handler<T> = Arc::new(move |job: T| Box::pin(handler(job)) as BoxedFuture);
         Self {
             semaphore: Arc::new(Semaphore::new(max_concurrent.get())),
             handler,

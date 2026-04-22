@@ -262,12 +262,7 @@ impl<E: HttpExecutor> HttpExecutor for RetryingClient<E> {
 fn is_idempotent(method: &Method) -> bool {
     matches!(
         *method,
-        Method::GET
-            | Method::HEAD
-            | Method::PUT
-            | Method::DELETE
-            | Method::OPTIONS
-            | Method::TRACE
+        Method::GET | Method::HEAD | Method::PUT | Method::DELETE | Method::OPTIONS | Method::TRACE
     )
 }
 
@@ -331,10 +326,7 @@ mod tests {
     }
 
     impl HttpExecutor for MockExecutor {
-        fn execute(
-            &self,
-            _req: Request,
-        ) -> impl Future<Output = UtilsResult<Response>> + Send {
+        fn execute(&self, _req: Request) -> impl Future<Output = UtilsResult<Response>> + Send {
             // Pop the next scripted response synchronously so the lock
             // never crosses an await point.
             let kind = {
@@ -349,10 +341,8 @@ mod tests {
 
             async move {
                 match kind {
-                    ResponseKind::NetworkError => {
-                        Err(Report::new(UtilsError::Network)
-                            .attach_printable("scripted network failure"))
-                    }
+                    ResponseKind::NetworkError => Err(Report::new(UtilsError::Network)
+                        .attach_printable("scripted network failure")),
                     other => {
                         let (status, retry_after) = match other {
                             ResponseKind::Status(s) => (s, None),
@@ -447,9 +437,7 @@ mod tests {
 
     #[tokio::test]
     async fn does_not_retry_non_idempotent_by_default() {
-        let mock = MockExecutor::new(vec![
-            ResponseKind::Status(StatusCode::TOO_MANY_REQUESTS),
-        ]);
+        let mock = MockExecutor::new(vec![ResponseKind::Status(StatusCode::TOO_MANY_REQUESTS)]);
         let client = RetryingClient::new(
             mock,
             fast_policy().max_attempts(NonZeroU32::new(3).unwrap()),
@@ -484,9 +472,9 @@ mod tests {
 
     #[tokio::test]
     async fn ignores_statuses_outside_the_retry_set() {
-        let mock = MockExecutor::new(vec![
-            ResponseKind::Status(StatusCode::INTERNAL_SERVER_ERROR),
-        ]);
+        let mock = MockExecutor::new(vec![ResponseKind::Status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )]);
         let client = RetryingClient::new(
             mock,
             fast_policy().max_attempts(NonZeroU32::new(3).unwrap()),

@@ -46,9 +46,7 @@ impl Client {
     pub async fn execute(&self, req: Request) -> UtilsResult<Response> {
         match self {
             Client::RateLimited(c) => c.execute(req).await,
-            Client::Unrestricted(c) => {
-                c.execute(req).await.map_err(into_network_or_http)
-            }
+            Client::Unrestricted(c) => c.execute(req).await.map_err(into_network_or_http),
         }
     }
 

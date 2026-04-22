@@ -7,6 +7,10 @@ mod client;
 mod rate_limit;
 mod retry;
 
+pub mod nats;
+pub mod validation;
+
 pub use client::{Client, RateLimitedClient};
 pub use rate_limit::RateLimitWindow;
 pub use retry::{HttpExecutor, RetryPolicy, RetryingClient};
+pub use validation::validate_and_parse_json;

@@ -139,6 +139,92 @@ let request = reqwest::Request::new(reqwest::Method::GET, "https://example.com/"
 let response = client.execute(request).await?; // UtilsResult<Response>
 ```
 
+#### Input validation (`network::security`)
+
+DoS-resistant JSON ingestion. `validate_and_parse_json` enforces a raw
+payload-size cap and a JSON nesting-depth cap **before** the bytes reach
+`serde_json`, so a single oversized or pathologically deep input cannot
+tie up a worker. The depth scan tracks string literals and escaped
+quotes, so brackets inside strings are ignored.
+
+| Item                       | Kind | Summary                                                                                                                                                                                                                         |
+| -------------------------- | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `validate_and_parse_json`  | fn   | Reject oversize payloads or JSON that nests beyond a depth cap, then deserialize into `T: DeserializeOwned`. Returns a `UtilsResult<T>`; all failure modes classify as `UtilsError::Internal` with a distinguishing attachment. |
+
+Re-exported at `rust_utils::network::validate_and_parse_json` for
+convenience.
+
+```rust,no_run
+use rust_utils::network::validate_and_parse_json;
+use rust_utils::error::UtilsResult;
+
+fn decode(payload: &[u8]) -> UtilsResult<serde_json::Value> {
+    validate_and_parse_json(payload, /* max_body = */ 1024 * 1024, /* max_depth = */ 32)
+}
+```
+
+#### NATS (`network::nats`)
+
+Typed request/reply on top of [`async_nats`](https://docs.rs/async-nats). JSON
+payloads, optional TLS from a PEM bundle, and a concurrent handler loop that
+classifies errors through [`UtilsResult`](#error-handling).
+
+Message types are declared **per method** rather than on the struct: a single
+`NatsClient` can request on one subject with types `(Req, Resp)` and serve
+another subject with unrelated types. Handlers return `UtilsResult<Resp>`, so
+business errors log + drop (no reply) instead of being papered over with
+infallible responses.
+
+| Item                                 | Kind     | Summary                                                                                                                                                                                                                                                               |
+| ------------------------------------ | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `NatsCredentials`                    | struct   | User/password pair consumed by `NatsConnectOptions::credentials`.                                                                                                                                                                                                      |
+| `NatsConnectOptions`                 | struct   | Builder for connection options (`url`, `credentials`, `tls_root_certs`, `protocol_request_timeout`). Fluent setters; private fields so new options can be added without breaking callers.                                                                             |
+| `SubscriptionConfig`                 | struct   | Runtime config for `serve_request_reply`: `max_concurrency` (`0` = unbounded) and `max_payload_bytes` (larger messages are dropped with a `warn` log). Defaults: 16 / 1 MiB.                                                                                          |
+| `NatsClient`                         | struct   | Thin wrapper around `async_nats::Client`. `Clone`-cheap (refcounted).                                                                                                                                                                                                 |
+| `NatsClient::connect`                | async fn | Establish a connection from a `NatsConnectOptions`. Installs the rustls `ring` crypto provider idempotently when TLS is requested.                                                                                                                                    |
+| `NatsClient::from_async_nats`        | fn       | Wrap an existing `async_nats::Client`. Lets callers manage `ConnectOptions` themselves or share one client across multiple wrappers.                                                                                                                                  |
+| `NatsClient::inner`                  | fn       | Borrow the underlying `async_nats::Client` for features not surfaced here (JetStream, headers, flush, …).                                                                                                                                                             |
+| `NatsClient::publish`                | async fn | JSON-encode `msg` and publish on `subject`. Fire-and-forget; returns once the publish is flushed.                                                                                                                                                                     |
+| `NatsClient::request`                | async fn | Serialize, send, await the reply and deserialize into `Resp`. Serialize errors → `UtilsError::Internal`, transport errors → `UtilsError::Network`, decode errors of the reply → `UtilsError::Internal` (with the raw size attached for debugging).                    |
+| `NatsClient::serve_request_reply`    | async fn | Subscribe to `subject` and fan out incoming messages through `handler` concurrently (capped by `SubscriptionConfig`). Replies only when the message carries a `reply` subject; handler errors and decode failures are logged + dropped so a bad message never crashes the loop. |
+| `install_default_crypto_provider`    | fn       | Idempotently install the rustls `ring` crypto provider. Exposed for callers that bypass `connect` and build their own `ConnectOptions`.                                                                                                                               |
+
+Example — acting as both a requester and a responder:
+
+```rust,no_run
+use rust_utils::error::{UtilsReport, UtilsResult};
+use rust_utils::network::nats::{NatsClient, NatsConnectOptions, SubscriptionConfig};
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+struct Echo { payload: String }
+
+# async fn run() -> UtilsResult<()> {
+let client = NatsClient::connect(
+    NatsConnectOptions::new("nats://localhost:4222"),
+).await?;
+
+// Server role: spawn a handler loop on `svc.echo`.
+let serving = client.clone();
+tokio::spawn(async move {
+    let _ = serving
+        .serve_request_reply(
+            "svc.echo",
+            SubscriptionConfig::default(),
+            |req: Echo| async move { Ok::<_, UtilsReport>(req) },
+        )
+        .await;
+});
+
+// Client role: issue a request.
+let reply: Echo = client
+    .request("svc.echo", &Echo { payload: "ping".into() })
+    .await?;
+assert_eq!(reply.payload, "ping");
+# Ok(())
+# }
+```
+
 ### `secret`
 
 Opaque wrapper that redacts its inner value in `Debug` and `Display`
