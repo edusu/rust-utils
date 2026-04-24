@@ -1,15 +1,21 @@
 //! Configuration types for [`NatsClient`](super::NatsClient).
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::secret::Secret;
+
 /// User/password credentials for NATS authentication.
+///
+/// The password is wrapped in [`Secret`] so it does not leak through
+/// `Debug`/`Display` on enclosing error reports or traces.
 #[derive(Debug, Clone)]
 pub struct NatsCredentials {
     /// NATS user.
     pub user: String,
-    /// NATS password.
-    pub password: String,
+    /// NATS password, redacted in `Debug`/`Display`.
+    pub password: Secret<String>,
 }
 
 /// Connection-level options consumed by
@@ -23,11 +29,12 @@ pub struct NatsCredentials {
 /// # use std::path::PathBuf;
 /// # use std::time::Duration;
 /// use rust_utils::network::nats::{NatsConnectOptions, NatsCredentials};
+/// use rust_utils::secret::Secret;
 ///
 /// let opts = NatsConnectOptions::new("nats://localhost:4222")
 ///     .credentials(NatsCredentials {
 ///         user: "svc".into(),
-///         password: "secret".into(),
+///         password: Secret::new("secret".into()),
 ///     })
 ///     .tls_root_certs(PathBuf::from("/etc/ssl/certs/ca.pem"))
 ///     .protocol_request_timeout(Duration::from_secs(10));
@@ -84,6 +91,10 @@ impl NatsConnectOptions {
 /// Runtime configuration for a single subscription served by
 /// [`NatsClient::serve_request_reply`](super::NatsClient::serve_request_reply).
 ///
+/// Constructed via [`SubscriptionConfig::new`] (or [`Default`]) and
+/// chained setters. Fields are private so new options can be added
+/// without breaking callers.
+///
 /// Defaults: 16 concurrent handlers, 1 MiB per-message payload cap,
 /// no queue group (plain fan-out subscribe).
 ///
@@ -100,29 +111,41 @@ impl NatsConnectOptions {
 /// unaware of whether their messages are fanned out or balanced.
 #[derive(Debug, Clone)]
 pub struct SubscriptionConfig {
-    /// Maximum number of messages processed concurrently. A value
-    /// of `0` disables the cap (unbounded fan-out).
-    pub max_concurrency: usize,
-    /// Maximum accepted payload size in bytes. Larger messages are
-    /// discarded (logged at `warn` level) so a single oversized
-    /// message cannot OOM the worker.
-    pub max_payload_bytes: usize,
-    /// Optional queue-group name. `None` subscribes plainly (every
-    /// subscriber on the subject gets a copy); `Some(name)` joins the
-    /// queue group so messages are load-balanced across members.
-    pub queue_group: Option<String>,
+    pub(crate) max_concurrency: Option<NonZeroUsize>,
+    pub(crate) max_payload_bytes: usize,
+    pub(crate) queue_group: Option<String>,
 }
 
 impl SubscriptionConfig {
     /// Build a config with explicit concurrency / payload values and
-    /// no queue group. Use [`Self::queue_group`] to opt into
-    /// load-balancing.
-    pub const fn new(max_concurrency: usize, max_payload_bytes: usize) -> Self {
+    /// no queue group.
+    ///
+    /// # Arguments
+    /// * `max_concurrency` — `Some(n)` caps in-flight handlers at `n`;
+    ///   `None` leaves fan-out unbounded.
+    /// * `max_payload_bytes` — reject messages larger than this.
+    pub const fn new(max_concurrency: Option<NonZeroUsize>, max_payload_bytes: usize) -> Self {
         Self {
             max_concurrency,
             max_payload_bytes,
             queue_group: None,
         }
+    }
+
+    /// Cap the maximum number of messages processed concurrently.
+    /// Pass `None` for unbounded fan-out.
+    pub fn max_concurrency(mut self, cap: Option<NonZeroUsize>) -> Self {
+        self.max_concurrency = cap;
+        self
+    }
+
+    /// Replace the per-message payload cap.
+    ///
+    /// Messages above this size are dropped (logged at `warn`) so a
+    /// single oversized message cannot OOM the worker.
+    pub fn max_payload_bytes(mut self, bytes: usize) -> Self {
+        self.max_payload_bytes = bytes;
+        self
     }
 
     /// Join the named queue group so messages delivered to the
@@ -138,7 +161,7 @@ impl SubscriptionConfig {
 impl Default for SubscriptionConfig {
     fn default() -> Self {
         Self {
-            max_concurrency: 16,
+            max_concurrency: NonZeroUsize::new(16),
             max_payload_bytes: 1024 * 1024,
             queue_group: None,
         }

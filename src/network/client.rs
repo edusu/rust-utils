@@ -50,7 +50,11 @@ impl Client {
         }
     }
 
-    /// Return the underlying [`reqwest::Client`]
+    /// Return the underlying [`reqwest::Client`].
+    ///
+    /// On the [`Self::RateLimited`] variant this **bypasses the rate
+    /// limiter** — requests dispatched through the returned reference
+    /// are not paced by the limiter attached to this handle.
     pub fn inner_client(&self) -> &ReqwestClient {
         match self {
             Client::RateLimited(c) => c.inner_client(),

@@ -83,6 +83,11 @@ impl<T: Send + 'static> WorkerPool<T> {
     /// Submit a job. Suspends when `max_concurrent` tasks are already
     /// running, resuming once a slot frees up.
     pub async fn submit(&mut self, job: T) {
+        // Reap any already-finished tasks so the `JoinSet` does not
+        // grow without bound on long-running pools that submit many
+        // short-lived jobs.
+        while self.joins.try_join_next().is_some() {}
+
         // `acquire_owned` returns a permit tied to the semaphore's
         // lifetime via `Arc`. The permit is dropped inside the
         // spawned task, freeing the slot on completion.

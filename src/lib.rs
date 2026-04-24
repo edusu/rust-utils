@@ -3,6 +3,7 @@
 //!
 //! Each sub-module is self-contained and can be used in isolation.
 
+pub(crate) mod backoff;
 pub mod concurrency;
 pub mod error;
 pub mod network;

@@ -20,12 +20,14 @@
 
 use std::future::Future;
 use std::num::NonZeroU32;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use reqwest::header::RETRY_AFTER;
 use reqwest::{Method, Request, Response, StatusCode};
+use tokio_util::sync::CancellationToken;
 
 use super::client::{Client, RateLimitedClient, into_network_or_http};
+use crate::backoff::compute_delay;
 use crate::error::{UtilsError, UtilsResult};
 
 /// Abstraction over anything capable of executing a
@@ -164,19 +166,43 @@ impl RetryPolicy {
 /// Retries replay the original request via [`Request::try_clone`]; if
 /// the request body cannot be cloned (e.g. a streaming upload), no
 /// retry is attempted and the first observed result is returned.
+///
+/// Optionally takes a [`CancellationToken`] via
+/// [`RetryingClient::with_cancellation`]: when set, backoff sleeps are
+/// wrapped in a `select!` that aborts the retry loop the moment the
+/// token fires, so a server-sent `Retry-After: 30` does not block
+/// graceful shutdown for the full delay.
 #[derive(Debug, Clone)]
 pub struct RetryingClient<E> {
     inner: E,
     policy: RetryPolicy,
+    cancel: Option<CancellationToken>,
 }
 
 impl<E: HttpExecutor> RetryingClient<E> {
     /// Wrap `inner` with the given retry `policy`.
     pub fn new(inner: E, policy: RetryPolicy) -> Self {
-        Self { inner, policy }
+        Self {
+            inner,
+            policy,
+            cancel: None,
+        }
+    }
+
+    /// Attach a cancellation token so backoff sleeps observe shutdown.
+    ///
+    /// When the token fires during a backoff window the retry loop
+    /// stops and returns the last observed result instead of waiting
+    /// out the full delay.
+    pub fn with_cancellation(mut self, token: CancellationToken) -> Self {
+        self.cancel = Some(token);
+        self
     }
 
     /// Reference to the wrapped executor.
+    ///
+    /// Requests dispatched directly through the returned reference
+    /// **bypass the retry policy**.
     pub fn inner(&self) -> &E {
         &self.inner
     }
@@ -209,11 +235,30 @@ impl<E: HttpExecutor> RetryingClient<E> {
                 break;
             };
             let delay = self.compute_delay(attempt, &last);
-            tokio::time::sleep(delay).await;
+            if !self.sleep_interruptible(delay).await {
+                // Shutdown arrived during backoff — surface the last
+                // observed result instead of replaying the request.
+                break;
+            }
             last = self.inner.execute(retry_req).await;
         }
 
         last
+    }
+
+    /// Sleep for `delay`, returning `false` if a cancellation token is
+    /// attached and fires before the sleep completes. When no token is
+    /// attached, always sleeps the full duration and returns `true`.
+    async fn sleep_interruptible(&self, delay: Duration) -> bool {
+        let Some(token) = self.cancel.as_ref() else {
+            tokio::time::sleep(delay).await;
+            return true;
+        };
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => false,
+            _ = tokio::time::sleep(delay) => true,
+        }
     }
 
     /// Whether the last result qualifies for another attempt.
@@ -241,14 +286,12 @@ impl<E: HttpExecutor> RetryingClient<E> {
         {
             return server_delay.min(self.policy.max_backoff);
         }
-        let factor = 2u32.saturating_pow(attempt - 1);
-        let uncapped = self.policy.base_backoff.saturating_mul(factor);
-        let capped = uncapped.min(self.policy.max_backoff);
-        if self.policy.jitter {
-            full_jitter(capped)
-        } else {
-            capped
-        }
+        compute_delay(
+            self.policy.base_backoff,
+            self.policy.max_backoff,
+            attempt,
+            self.policy.jitter,
+        )
     }
 }
 
@@ -274,22 +317,6 @@ fn parse_retry_after(resp: &Response) -> Option<Duration> {
     let raw = resp.headers().get(RETRY_AFTER)?.to_str().ok()?;
     let secs: u64 = raw.trim().parse().ok()?;
     Some(Duration::from_secs(secs))
-}
-
-/// Draw a duration uniformly from `[0, capped]` using the current
-/// time's nanoseconds as a cheap entropy source.
-///
-/// Not cryptographically random — adequate for backoff jitter.
-fn full_jitter(capped: Duration) -> Duration {
-    let capped_nanos = u64::try_from(capped.as_nanos()).unwrap_or(u64::MAX);
-    if capped_nanos == 0 {
-        return Duration::ZERO;
-    }
-    let source = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    Duration::from_nanos(source % capped_nanos)
 }
 
 #[cfg(test)]

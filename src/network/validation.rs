@@ -22,41 +22,34 @@ use serde::de::DeserializeOwned;
 
 use crate::error::{UtilsError, UtilsResult};
 
-/// Scan `data` as JSON and return the maximum nesting depth reached.
+/// Validate JSON structure: bracket depth stays within `max_depth`,
+/// every opening bracket has a match, and string literals are closed.
 ///
-/// Short-circuits with an `Err` report as soon as the running depth
-/// exceeds `max_depth`. After the full scan, also errors on
-/// unmatched brackets or unterminated string literals.
+/// Short-circuits with an `Err` report the moment the running depth
+/// exceeds `max_depth`. String tracking uses a forward-only
+/// `escaped` flag so the scan is O(n) regardless of how many
+/// backslashes appear inside a string.
 ///
 /// Depth is shared across `{` and `[`: `[{"k":[]}]` reaches depth 3.
-fn calculate_json_depth(data: &[u8], max_depth: usize) -> UtilsResult<usize> {
+fn validate_json_structure(data: &[u8], max_depth: usize) -> UtilsResult<()> {
     let mut current_depth: usize = 0;
-    let mut max_depth_seen: usize = 0;
     let mut inside_string = false;
+    let mut escaped = false;
 
     for (i, &byte) in data.iter().enumerate() {
         // 1-based for human-readable error messages.
         let position = i + 1;
 
         if inside_string {
-            if byte == b'"' {
-                // Count contiguous backslashes immediately preceding
-                // the quote: an even count (including zero) means the
-                // quote is not escaped and closes the string.
-                let mut escape_count = 0;
-                let mut j = i;
-                while j > 0 {
-                    j -= 1;
-                    if data[j] == b'\\' {
-                        escape_count += 1;
-                    } else {
-                        break;
-                    }
-                }
-
-                if escape_count % 2 == 0 {
-                    inside_string = false;
-                }
+            // Toggling `escaped` on every `\` handles the `\\` case
+            // correctly: the second backslash resets the flag so a
+            // following `"` is treated as string-terminating.
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                inside_string = false;
             }
             continue;
         }
@@ -65,10 +58,9 @@ fn calculate_json_depth(data: &[u8], max_depth: usize) -> UtilsResult<usize> {
             b'"' => inside_string = true,
             b'{' | b'[' => {
                 current_depth += 1;
-                max_depth_seen = max_depth_seen.max(current_depth);
-                if max_depth_seen > max_depth {
+                if current_depth > max_depth {
                     return Err(Report::new(UtilsError::Internal).attach_printable(format!(
-                        "JSON depth limit exceeded at position {position}: depth {max_depth_seen}, max {max_depth}"
+                        "JSON depth limit exceeded at position {position}: depth {current_depth}, max {max_depth}"
                     )));
                 }
             }
@@ -99,7 +91,7 @@ fn calculate_json_depth(data: &[u8], max_depth: usize) -> UtilsResult<usize> {
         )));
     }
 
-    Ok(max_depth_seen)
+    Ok(())
 }
 
 /// Validate size and nesting depth, then deserialize `data` as JSON
@@ -130,9 +122,7 @@ where
         )));
     }
 
-    // The depth scan already rejects anything above the cap, so its
-    // return value is informational (could feed metrics later).
-    let _max_depth_seen = calculate_json_depth(data, max_json_depth)?;
+    validate_json_structure(data, max_json_depth)?;
 
     serde_json::from_slice(data)
         .change_context(UtilsError::Internal)

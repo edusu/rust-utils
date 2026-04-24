@@ -294,10 +294,8 @@ impl Default for ShutdownController {
 async fn wait_for_termination_signal() {
     use tokio::signal::unix::{SignalKind, signal};
 
-    let mut sigint = signal(SignalKind::interrupt())
-        .expect("failed to install SIGINT handler");
-    let mut sigterm = signal(SignalKind::terminate())
-        .expect("failed to install SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
 
     tokio::select! {
         _ = sigint.recv() => {},
@@ -426,20 +424,37 @@ mod tests {
         assert!(controller.is_shutdown());
     }
 
-    /// A `spawn_critical` task that returns `Ok(())` leaves the token
-    /// untouched.
+    /// A `spawn_critical` task that returns `Ok(())` must not cancel
+    /// the token before `shutdown()` is called. A sibling waiting on
+    /// the token should therefore still be running at the point
+    /// where we trigger shutdown manually.
     #[tokio::test]
     async fn spawn_critical_ok_does_not_cancel() {
         let controller = ShutdownController::new();
+        let sibling_saw_premature_cancel = Arc::new(AtomicBool::new(false));
+
+        let token = controller.token();
+        let flag = Arc::clone(&sibling_saw_premature_cancel);
+        controller.spawn(async move {
+            tokio::select! {
+                _ = token.cancelled() => flag.store(true, Ordering::SeqCst),
+                _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+            }
+        });
+
         controller.spawn_critical(async { Ok(()) });
+        // Give the critical task a chance to finish and the sibling a
+        // chance to observe any premature cancel before we force one.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !sibling_saw_premature_cancel.load(Ordering::SeqCst),
+            "Ok(()) from a critical task must not cancel the token"
+        );
+
         controller
             .shutdown(Duration::from_secs(1))
             .await
             .expect("critical Ok must shutdown cleanly");
-        assert!(!controller.is_shutdown() || controller.is_shutdown());
-        // ^ After shutdown(), the token is cancelled by definition.
-        // The meaningful check is that no OTHER task saw a premature
-        // cancel — tested in `spawn_critical_err_cancels_other_tasks`.
     }
 
     /// A `spawn_critical` task that returns `Err` cancels the token
@@ -462,8 +477,7 @@ mod tests {
         // to start waiting on the token.
         controller.spawn_critical(async {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            Err(Report::new(UtilsError::Internal)
-                .attach_printable("synthetic critical failure"))
+            Err(Report::new(UtilsError::Internal).attach_printable("synthetic critical failure"))
         });
 
         controller

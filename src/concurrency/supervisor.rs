@@ -54,11 +54,12 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::num::NonZeroU32;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use error_stack::Report;
 use tokio_util::sync::CancellationToken;
 
+use crate::backoff::compute_delay;
 use crate::error::{UtilsError, UtilsResult};
 
 /// Builder + runner for a restart-policy supervisor.
@@ -302,7 +303,7 @@ impl Supervisor {
             }
 
             consecutive = consecutive.saturating_add(1);
-            let sleep_for = compute_backoff(
+            let sleep_for = compute_delay(
                 self.base_backoff,
                 self.max_backoff,
                 consecutive,
@@ -341,36 +342,6 @@ impl Default for Supervisor {
     }
 }
 
-/// Compute the next backoff: `base * 2^(attempt-1)`, capped by `max`,
-/// optionally passed through full jitter.
-fn compute_backoff(base: Duration, max: Duration, attempt: u32, jitter: bool) -> Duration {
-    // `2^(attempt-1)` saturates at `attempt >= 33` for `u32`, which is
-    // well past what any reasonable cap would tolerate.
-    let factor = 1u32.checked_shl(attempt.saturating_sub(1)).unwrap_or(u32::MAX);
-    let uncapped = base.saturating_mul(factor);
-    let capped = uncapped.min(max);
-    if jitter { full_jitter(capped) } else { capped }
-}
-
-/// Draw a duration uniformly from `[0, capped]` using the current
-/// time's nanoseconds as a cheap entropy source.
-///
-/// Duplicated from `network::retry` on purpose — each sub-module of
-/// the crate is meant to stand alone, so `concurrency::supervisor`
-/// does not reach across the tree for a private helper. Not
-/// cryptographically random — adequate for backoff jitter.
-fn full_jitter(capped: Duration) -> Duration {
-    let capped_nanos = u64::try_from(capped.as_nanos()).unwrap_or(u64::MAX);
-    if capped_nanos == 0 {
-        return Duration::ZERO;
-    }
-    let source = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    Duration::from_nanos(source % capped_nanos)
-}
-
 /// Best-effort panic message extraction from a [`tokio::task::JoinError`].
 fn panic_message(err: &tokio::task::JoinError) -> String {
     // `JoinError::into_panic` consumes the error, so we cannot use it
@@ -406,8 +377,7 @@ mod tests {
                 let calls = Arc::clone(&factory_calls);
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
-                    Err(Report::new(UtilsError::Internal)
-                        .attach_printable("synthetic failure"))
+                    Err(Report::new(UtilsError::Internal).attach_printable("synthetic failure"))
                 }
             })
             .await;
@@ -516,20 +486,5 @@ mod tests {
 
         let err = outcome.expect_err("panic must terminate supervisor");
         assert!(matches!(err.current_context(), UtilsError::Concurrency));
-    }
-
-    /// Backoff grows exponentially up to the cap.
-    #[test]
-    fn backoff_saturates_at_cap_without_jitter() {
-        let base = Duration::from_millis(100);
-        let cap = Duration::from_secs(1);
-        assert_eq!(compute_backoff(base, cap, 1, false), Duration::from_millis(100));
-        assert_eq!(compute_backoff(base, cap, 2, false), Duration::from_millis(200));
-        assert_eq!(compute_backoff(base, cap, 3, false), Duration::from_millis(400));
-        assert_eq!(compute_backoff(base, cap, 4, false), Duration::from_millis(800));
-        // 5 -> 1600ms, capped at 1000ms
-        assert_eq!(compute_backoff(base, cap, 5, false), cap);
-        // extreme attempt count still saturates, does not overflow
-        assert_eq!(compute_backoff(base, cap, 1_000, false), cap);
     }
 }

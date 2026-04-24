@@ -1,6 +1,7 @@
 //! Typed, error-stack-aware wrapper over [`async_nats::Client`].
 
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use async_nats::{Client, ConnectOptions};
@@ -67,7 +68,7 @@ impl NatsClient {
         let mut conn = ConnectOptions::new().request_timeout(Some(opts.protocol_request_timeout));
 
         if let Some(creds) = opts.credentials {
-            conn = conn.user_and_password(creds.user, creds.password);
+            conn = conn.user_and_password(creds.user, creds.password.into_inner());
         }
 
         if let Some(path) = opts.tls_root_certs {
@@ -108,15 +109,16 @@ impl NatsClient {
         Msg: Serialize,
     {
         let subject = subject.into();
-        let payload = serde_json::to_vec(msg)
-            .change_context(UtilsError::Internal)
-            .attach_printable("failed to serialize outbound NATS payload")?;
+        let payload = serialize_json_payload(msg, "failed to serialize outbound NATS payload")?;
+        // Compute the error context eagerly so `subject` can be moved
+        // into `publish` instead of cloned.
+        let err_ctx = format!("nats subject: {subject}");
 
         self.client
-            .publish(subject.clone(), payload.into())
+            .publish(subject, payload.into())
             .await
             .change_context(UtilsError::Network)
-            .attach_printable_lazy(|| format!("nats subject: {subject}"))
+            .attach_printable(err_ctx)
     }
 
     /// Send `msg` as a NATS request and deserialize the reply.
@@ -136,16 +138,15 @@ impl NatsClient {
         Resp: DeserializeOwned,
     {
         let subject = subject.into();
-        let payload = serde_json::to_vec(msg)
-            .change_context(UtilsError::Internal)
-            .attach_printable("failed to serialize NATS request")?;
+        let payload = serialize_json_payload(msg, "failed to serialize NATS request")?;
+        let err_ctx = format!("nats subject: {subject}");
 
         let reply = self
             .client
             .request(subject.clone(), payload.into())
             .await
             .change_context(UtilsError::Network)
-            .attach_printable_lazy(|| format!("nats subject: {subject}"))?;
+            .attach_printable(err_ctx)?;
 
         serde_json::from_slice::<Resp>(&reply.payload)
             .change_context(UtilsError::Internal)
@@ -229,22 +230,26 @@ impl NatsClient {
         // Queue subscribe vs plain subscribe is decided here: the
         // only difference on the wire is whether the SUB frame
         // carries a queue-group name, so the downstream pipeline is
-        // identical either way.
+        // identical either way. Error contexts are computed eagerly
+        // so the owned strings can be moved into the subscribe calls
+        // instead of cloned.
         let subscriber = match queue_group {
-            Some(group) => self
-                .client
-                .queue_subscribe(subject_name.clone(), group.clone())
-                .await
-                .change_context(UtilsError::Network)
-                .attach_printable_lazy(|| {
-                    format!("nats subject: {subject_name} (queue group: {group})")
-                })?,
-            None => self
-                .client
-                .subscribe(subject_name.clone())
-                .await
-                .change_context(UtilsError::Network)
-                .attach_printable_lazy(|| format!("nats subject: {subject_name}"))?,
+            Some(group) => {
+                let err_ctx = format!("nats subject: {subject_name} (queue group: {group})");
+                self.client
+                    .queue_subscribe(subject_name.clone(), group)
+                    .await
+                    .change_context(UtilsError::Network)
+                    .attach_printable(err_ctx)?
+            }
+            None => {
+                let err_ctx = format!("nats subject: {subject_name}");
+                self.client
+                    .subscribe(subject_name.clone())
+                    .await
+                    .change_context(UtilsError::Network)
+                    .attach_printable(err_ctx)?
+            }
         };
 
         // Shared state moved into the concurrent stream handler. The
@@ -255,11 +260,7 @@ impl NatsClient {
         let client = self.client.clone();
         let handler = Arc::new(handler);
         let subject_name = Arc::new(subject_name);
-        let concurrency = if max_concurrency == 0 {
-            None
-        } else {
-            Some(max_concurrency)
-        };
+        let concurrency = max_concurrency.map(NonZeroUsize::get);
 
         subscriber
             .for_each_concurrent(concurrency, move |message| {
@@ -350,14 +351,25 @@ async fn handle_message<Req, Resp, F, Fut>(
         }
     };
 
-    if let Err(err) = client.publish(reply.clone(), payload.into()).await {
+    // Render `reply` for the error branch before moving it into
+    // `publish`: the allocation only happens if the publish fails.
+    let reply_str = reply.to_string();
+    if let Err(err) = client.publish(reply, payload.into()).await {
         tracing::error!(
             subject = %subject_name,
-            reply = %reply,
+            reply = %reply_str,
             error = %err,
             "failed to publish NATS reply"
         );
     }
+}
+
+/// JSON-encode `msg`, classifying serialization failures as
+/// [`UtilsError::Internal`] with `context` attached for debugging.
+fn serialize_json_payload<T: Serialize>(msg: &T, context: &'static str) -> UtilsResult<Vec<u8>> {
+    serde_json::to_vec(msg)
+        .change_context(UtilsError::Internal)
+        .attach_printable(context)
 }
 
 /// Install the rustls `ring` crypto provider as the process default
