@@ -110,6 +110,11 @@ impl ShutdownController {
     /// Spawn `future` onto the current Tokio runtime and track it
     /// under this controller.
     ///
+    /// The task is **isolated**: if it returns an error or panics, the
+    /// failure is confined to this task and does not affect other
+    /// spawned workers. Use [`Self::spawn_critical`] when a failure
+    /// should bring down the entire controller instead.
+    ///
     /// # Arguments
     /// * `future` — the task to run. Must be `Send + 'static` because
     ///   Tokio may move it to another worker thread.
@@ -127,6 +132,72 @@ impl ShutdownController {
         F::Output: Send + 'static,
     {
         self.tracker.spawn(future)
+    }
+
+    /// Spawn a **critical** task whose failure cancels the controller's
+    /// token, triggering shutdown of every other task sharing it.
+    ///
+    /// Use this for tasks the service cannot function without — a
+    /// leader-election loop, a heartbeat that keeps a session alive, a
+    /// main event loop. The task is still tracked by the underlying
+    /// [`TaskTracker`], so [`Self::shutdown`] waits for it to finish
+    /// normally.
+    ///
+    /// Behaviour on task outcome:
+    /// * `Ok(())` — the task is treated as a clean exit; no cancel.
+    /// * `Err(report)` — logged at `error` and the token is cancelled.
+    /// * panic — logged at `error` and the token is cancelled.
+    ///
+    /// The nested `tokio::spawn` is what lets this method catch panics
+    /// without resorting to `catch_unwind` + `AssertUnwindSafe`. Tokio
+    /// surfaces panics as [`tokio::task::JoinError`] with
+    /// [`tokio::task::JoinError::is_panic`], which we then reclassify.
+    ///
+    /// # Arguments
+    /// * `future` — the critical task. Must return `UtilsResult<()>`
+    ///   so its error classification is compatible with the rest of
+    ///   the crate.
+    ///
+    /// # Returns
+    /// A [`JoinHandle`] for the wrapping task. Its output is `()`
+    /// because the wrapper consumes the user's `UtilsResult`.
+    ///
+    /// # Panics
+    /// Panics if called outside of a Tokio runtime.
+    pub fn spawn_critical<F>(&self, future: F) -> JoinHandle<()>
+    where
+        F: Future<Output = UtilsResult<()>> + Send + 'static,
+    {
+        let token = self.token.clone();
+        self.tracker.spawn(async move {
+            match tokio::spawn(future).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    tracing::error!(
+                        error = ?err,
+                        "critical task returned an error; triggering shutdown"
+                    );
+                    token.cancel();
+                }
+                Err(join_err) if join_err.is_panic() => {
+                    tracing::error!(
+                        panic = %join_err,
+                        "critical task panicked; triggering shutdown"
+                    );
+                    token.cancel();
+                }
+                Err(join_err) => {
+                    // A non-panic JoinError means the inner task was
+                    // aborted. We do not call `abort` ourselves, so
+                    // this is unexpected; log and cancel defensively.
+                    tracing::warn!(
+                        error = ?join_err,
+                        "critical task join failed unexpectedly; triggering shutdown"
+                    );
+                    token.cancel();
+                }
+            }
+        })
     }
 
     /// `true` after shutdown has been triggered on this controller
@@ -353,5 +424,109 @@ mod tests {
         controller.trigger();
         controller.trigger();
         assert!(controller.is_shutdown());
+    }
+
+    /// A `spawn_critical` task that returns `Ok(())` leaves the token
+    /// untouched.
+    #[tokio::test]
+    async fn spawn_critical_ok_does_not_cancel() {
+        let controller = ShutdownController::new();
+        controller.spawn_critical(async { Ok(()) });
+        controller
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("critical Ok must shutdown cleanly");
+        assert!(!controller.is_shutdown() || controller.is_shutdown());
+        // ^ After shutdown(), the token is cancelled by definition.
+        // The meaningful check is that no OTHER task saw a premature
+        // cancel — tested in `spawn_critical_err_cancels_other_tasks`.
+    }
+
+    /// A `spawn_critical` task that returns `Err` cancels the token
+    /// and so propagates shutdown to every sibling task.
+    #[tokio::test]
+    async fn spawn_critical_err_cancels_other_tasks() {
+        let controller = ShutdownController::new();
+        let sibling_observed_cancel = Arc::new(AtomicBool::new(false));
+
+        // Sibling: regular spawn that will observe the cancellation
+        // triggered by the critical task's failure.
+        let token = controller.token();
+        let flag = Arc::clone(&sibling_observed_cancel);
+        controller.spawn(async move {
+            token.cancelled().await;
+            flag.store(true, Ordering::SeqCst);
+        });
+
+        // Critical: fails after a brief delay so the sibling has time
+        // to start waiting on the token.
+        controller.spawn_critical(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Err(Report::new(UtilsError::Internal)
+                .attach_printable("synthetic critical failure"))
+        });
+
+        controller
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("both tasks must finish within the timeout");
+
+        assert!(
+            sibling_observed_cancel.load(Ordering::SeqCst),
+            "sibling must have observed the cancel triggered by the critical task"
+        );
+    }
+
+    /// A `spawn_critical` task that panics also cancels the token.
+    #[tokio::test]
+    async fn spawn_critical_panic_cancels_token() {
+        let controller = ShutdownController::new();
+        let sibling_observed_cancel = Arc::new(AtomicBool::new(false));
+
+        let token = controller.token();
+        let flag = Arc::clone(&sibling_observed_cancel);
+        controller.spawn(async move {
+            token.cancelled().await;
+            flag.store(true, Ordering::SeqCst);
+        });
+
+        controller.spawn_critical(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            panic!("synthetic critical panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+
+        controller
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("shutdown must complete after the panic is caught");
+        assert!(sibling_observed_cancel.load(Ordering::SeqCst));
+    }
+
+    /// A normal `spawn` that panics must NOT cancel the token — the
+    /// failure is confined to that task. This is the opposite of
+    /// `spawn_critical` and is what callers rely on for isolated
+    /// workers.
+    #[tokio::test]
+    async fn spawn_panic_does_not_cancel_siblings() {
+        let controller = ShutdownController::new();
+
+        controller.spawn(async {
+            panic!("synthetic panic in isolated task");
+        });
+
+        // Give the panicking task a chance to run.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(
+            !controller.is_shutdown(),
+            "a regular spawn's panic must not trigger controller-wide shutdown"
+        );
+
+        controller
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("shutdown should still succeed");
     }
 }

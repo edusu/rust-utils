@@ -319,9 +319,16 @@ impl Supervisor {
                 // Interruptible sleep: a shutdown signal during the
                 // backoff window aborts the loop immediately instead
                 // of waiting out the full delay.
+                //
+                // `biased` + cancellation first makes shutdown strictly
+                // dominate the sleep: if both arms are ready at the same
+                // tick we always pick the cancel path. Random polling
+                // here would occasionally waste one loop iteration
+                // before noticing the shutdown.
                 tokio::select! {
-                    _ = tokio::time::sleep(sleep_for) => {},
+                    biased;
                     _ = token.cancelled() => return Ok(()),
+                    _ = tokio::time::sleep(sleep_for) => {},
                 }
             }
         }
