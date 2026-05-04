@@ -108,7 +108,7 @@ impl RateLimitedClient {
             RateLimitWindow::PerMinute(allowed) => Quota::per_minute(allowed),
             RateLimitWindow::Custom { period } => Quota::with_period(period).ok_or_else(|| {
                 Report::new(UtilsError::Config)
-                    .attach_printable("rate limit period must be non-zero")
+                    .attach("rate limit period must be non-zero")
             })?,
         };
         if let Some(b) = burst {

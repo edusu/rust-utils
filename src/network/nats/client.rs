@@ -80,7 +80,7 @@ impl NatsClient {
         let client = async_nats::connect_with_options(&url, conn)
             .await
             .change_context(UtilsError::Network)
-            .attach_printable_lazy(|| format!("nats url: {url}"))?;
+            .attach_with(|| format!("nats url: {url}"))?;
 
         Ok(Self { client })
     }
@@ -118,7 +118,7 @@ impl NatsClient {
             .publish(subject, payload.into())
             .await
             .change_context(UtilsError::Network)
-            .attach_printable(err_ctx)
+            .attach(err_ctx)
     }
 
     /// Send `msg` as a NATS request and deserialize the reply.
@@ -146,11 +146,11 @@ impl NatsClient {
             .request(subject.clone(), payload.into())
             .await
             .change_context(UtilsError::Network)
-            .attach_printable(err_ctx)?;
+            .attach(err_ctx)?;
 
         serde_json::from_slice::<Resp>(&reply.payload)
             .change_context(UtilsError::Internal)
-            .attach_printable_lazy(|| {
+            .attach_with(|| {
                 format!(
                     "failed to deserialize NATS reply on subject {subject} ({} bytes)",
                     reply.payload.len()
@@ -240,7 +240,7 @@ impl NatsClient {
                     .queue_subscribe(subject_name.clone(), group)
                     .await
                     .change_context(UtilsError::Network)
-                    .attach_printable(err_ctx)?
+                    .attach(err_ctx)?
             }
             None => {
                 let err_ctx = format!("nats subject: {subject_name}");
@@ -248,7 +248,7 @@ impl NatsClient {
                     .subscribe(subject_name.clone())
                     .await
                     .change_context(UtilsError::Network)
-                    .attach_printable(err_ctx)?
+                    .attach(err_ctx)?
             }
         };
 
@@ -369,7 +369,7 @@ async fn handle_message<Req, Resp, F, Fut>(
 fn serialize_json_payload<T: Serialize>(msg: &T, context: &'static str) -> UtilsResult<Vec<u8>> {
     serde_json::to_vec(msg)
         .change_context(UtilsError::Internal)
-        .attach_printable(context)
+        .attach(context)
 }
 
 /// Install the rustls `ring` crypto provider as the process default

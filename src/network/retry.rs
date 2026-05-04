@@ -369,7 +369,7 @@ mod tests {
             async move {
                 match kind {
                     ResponseKind::NetworkError => Err(Report::new(UtilsError::Network)
-                        .attach_printable("scripted network failure")),
+                        .attach("scripted network failure")),
                     other => {
                         let (status, retry_after) = match other {
                             ResponseKind::Status(s) => (s, None),

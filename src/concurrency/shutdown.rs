@@ -247,7 +247,7 @@ impl ShutdownController {
             Ok(()) => Ok(()),
             Err(_) => {
                 let remaining = self.tracker.len();
-                Err(Report::new(UtilsError::Concurrency).attach_printable(format!(
+                Err(Report::new(UtilsError::Concurrency).attach(format!(
                     "shutdown timed out after {timeout:?} with {remaining} task(s) still running",
                 )))
             }
@@ -477,7 +477,7 @@ mod tests {
         // to start waiting on the token.
         controller.spawn_critical(async {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            Err(Report::new(UtilsError::Internal).attach_printable("synthetic critical failure"))
+            Err(Report::new(UtilsError::Internal).attach("synthetic critical failure"))
         });
 
         controller

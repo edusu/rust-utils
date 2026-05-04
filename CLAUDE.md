@@ -15,7 +15,7 @@ The crate grows module-by-module as concrete needs arise in downstream projects.
 
 ## Error handling
 
-All fallible functions in this crate MUST return `crate::error::UtilsResult<T>` (alias for `Result<T, error_stack::Report<UtilsError>>`). Never expose `reqwest::Error`, `std::io::Error`, or other third-party error types in a public signature — classify them into a `UtilsError` variant and attach the original via `Report::new(err).change_context(UtilsError::…)` or `attach_printable`.
+All fallible functions in this crate MUST return `crate::error::UtilsResult<T>` (alias for `Result<T, error_stack::Report<UtilsError>>`). Never expose `reqwest::Error`, `std::io::Error`, or other third-party error types in a public signature — classify them into a `UtilsError` variant and attach the original via `Report::new(err).change_context(UtilsError::…)` or `attach` / `attach_with` (note: these were renamed from `attach_printable` / `attach_printable_lazy` in `error-stack` 0.6).
 
 When matching errors in retry/recovery logic, match on `report.current_context()` against a `UtilsError` variant. Do not downcast to the underlying dependency error.
 

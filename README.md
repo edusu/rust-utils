@@ -38,7 +38,7 @@ fn parse_port(raw: &str) -> UtilsResult<u16> {
     raw.parse::<u16>()
         .map_err(error_stack::Report::from)
         .change_context(UtilsError::Config)
-        .attach_printable_lazy(|| format!("raw input: {raw:?}"))
+        .attach_with(|| format!("raw input: {raw:?}"))
 }
 ```
 

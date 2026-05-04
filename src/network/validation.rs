@@ -59,14 +59,14 @@ fn validate_json_structure(data: &[u8], max_depth: usize) -> UtilsResult<()> {
             b'{' | b'[' => {
                 current_depth += 1;
                 if current_depth > max_depth {
-                    return Err(Report::new(UtilsError::Internal).attach_printable(format!(
+                    return Err(Report::new(UtilsError::Internal).attach(format!(
                         "JSON depth limit exceeded at position {position}: depth {current_depth}, max {max_depth}"
                     )));
                 }
             }
             b'}' | b']' => {
                 if current_depth == 0 {
-                    return Err(Report::new(UtilsError::Internal).attach_printable(format!(
+                    return Err(Report::new(UtilsError::Internal).attach(format!(
                         "invalid JSON: unmatched closing bracket at position {position}"
                     )));
                 }
@@ -82,11 +82,11 @@ fn validate_json_structure(data: &[u8], max_depth: usize) -> UtilsResult<()> {
     // instead of the downstream "unmatched bracket" symptom.
     if inside_string {
         return Err(Report::new(UtilsError::Internal)
-            .attach_printable("invalid JSON: unterminated string literal"));
+            .attach("invalid JSON: unterminated string literal"));
     }
 
     if current_depth != 0 {
-        return Err(Report::new(UtilsError::Internal).attach_printable(format!(
+        return Err(Report::new(UtilsError::Internal).attach(format!(
             "invalid JSON: {current_depth} unmatched opening bracket(s)"
         )));
     }
@@ -106,7 +106,7 @@ fn validate_json_structure(data: &[u8], max_depth: usize) -> UtilsResult<()> {
 /// Returns an [`UtilsError::Internal`] report when the body is too
 /// large, the structure is malformed, it nests deeper than allowed,
 /// or `serde_json` cannot deserialize it into `T`. The specific
-/// failure mode is encoded in the attached `attach_printable` message.
+/// failure mode is encoded in the attached `attach` message.
 pub fn validate_and_parse_json<T>(
     data: &[u8],
     max_request_body_size: usize,
@@ -116,7 +116,7 @@ where
     T: DeserializeOwned,
 {
     if data.len() > max_request_body_size {
-        return Err(Report::new(UtilsError::Internal).attach_printable(format!(
+        return Err(Report::new(UtilsError::Internal).attach(format!(
             "request body too large: {} bytes (max: {max_request_body_size})",
             data.len()
         )));
@@ -126,7 +126,7 @@ where
 
     serde_json::from_slice(data)
         .change_context(UtilsError::Internal)
-        .attach_printable("JSON deserialization failed")
+        .attach("JSON deserialization failed")
 }
 
 #[cfg(test)]

@@ -253,10 +253,10 @@ impl Supervisor {
                     let panic_msg = panic_message(&join_err);
                     if !self.restart_on_panic {
                         return Err(Report::new(UtilsError::Concurrency)
-                            .attach_printable(format!(
+                            .attach(format!(
                                 "supervised task [{name}] panicked and restart_on_panic is disabled"
                             ))
-                            .attach_printable(format!("panic: {panic_msg}")));
+                            .attach(format!("panic: {panic_msg}")));
                     }
                     tracing::error!(
                         supervisor = name,
@@ -269,8 +269,8 @@ impl Supervisor {
                     // shouldn't happen in our usage (we never call
                     // `abort`). Treat defensively as terminal.
                     return Err(Report::new(UtilsError::Concurrency)
-                        .attach_printable(format!("supervised task [{name}] join failed"))
-                        .attach_printable(format!("{join_err}")));
+                        .attach(format!("supervised task [{name}] join failed"))
+                        .attach(format!("{join_err}")));
                 }
             }
 
@@ -295,7 +295,7 @@ impl Supervisor {
                     .restart_window
                     .map(|w| format!(" within {w:?}"))
                     .unwrap_or_default();
-                return Err(Report::new(UtilsError::RetryExhausted).attach_printable(format!(
+                return Err(Report::new(UtilsError::RetryExhausted).attach(format!(
                     "supervisor [{name}] exhausted restart budget: {count} restarts{window_note} exceeds cap {cap}",
                     count = restart_history.len(),
                     cap = cap.get(),
@@ -377,7 +377,7 @@ mod tests {
                 let calls = Arc::clone(&factory_calls);
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
-                    Err(Report::new(UtilsError::Internal).attach_printable("synthetic failure"))
+                    Err(Report::new(UtilsError::Internal).attach("synthetic failure"))
                 }
             })
             .await;
