@@ -27,7 +27,7 @@ use reqwest::{Method, Request, Response, StatusCode};
 use tokio_util::sync::CancellationToken;
 
 use super::client::{Client, RateLimitedClient, into_network_or_http};
-use crate::backoff::compute_delay;
+use crate::backoff::{compute_delay, sleep_or_cancel};
 use crate::error::{UtilsError, UtilsResult};
 
 /// Abstraction over anything capable of executing a
@@ -250,15 +250,7 @@ impl<E: HttpExecutor> RetryingClient<E> {
     /// attached and fires before the sleep completes. When no token is
     /// attached, always sleeps the full duration and returns `true`.
     async fn sleep_interruptible(&self, delay: Duration) -> bool {
-        let Some(token) = self.cancel.as_ref() else {
-            tokio::time::sleep(delay).await;
-            return true;
-        };
-        tokio::select! {
-            biased;
-            _ = token.cancelled() => false,
-            _ = tokio::time::sleep(delay) => true,
-        }
+        sleep_or_cancel(self.cancel.as_ref(), delay).await
     }
 
     /// Whether the last result qualifies for another attempt.

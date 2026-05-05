@@ -295,11 +295,33 @@ Concurrency utilities built on top of the `tokio` runtime.
 | `Supervisor::restart_on_ok`             | fn       | Whether to restart when the task returns `Ok(())`. Default `true`.                                                                                                                              |
 | `Supervisor::restart_on_panic`          | fn       | Whether to restart when the task panics. Default `true`. When disabled, a panic terminates the supervisor with `UtilsError::Concurrency`.                                                       |
 | `Supervisor::run`                       | async fn | Drive the loop. Takes a `CancellationToken` (cloned into every restarted instance) and a factory `Fn(CancellationToken) -> Fut`. Returns `UtilsResult<()>`; budget exhaustion surfaces as `UtilsError::RetryExhausted` with the last error chained in. |
+| `Retry`                                 | struct   | Generic retry combinator for one-shot fallible async operations: max attempts, exponential backoff, optional full jitter, optional `CancellationToken`. `Clone`-cheap so a single tuned policy can be shared across many call sites. |
+| `Retry::new` / `default`                | fn       | Build with the default policy: 3 attempts, 200ms base backoff, 30s cap, jitter on, no cancellation token.                                                                                                                                            |
+| `Retry::max_attempts`                   | fn       | Total number of attempts (initial + retries). Takes `NonZeroU32`.                                                                                                                                                                                    |
+| `Retry::base_backoff` / `max_backoff`   | fn       | Exponential backoff between attempts: `base * 2^(attempt-1)` capped at `max_backoff`.                                                                                                                                                                |
+| `Retry::jitter`                         | fn       | Enable or disable full jitter on the computed backoff.                                                                                                                                                                                               |
+| `Retry::with_cancellation`              | fn       | Attach a `CancellationToken` so backoff sleeps abort on shutdown instead of waiting out the full delay.                                                                                                                                              |
+| `Retry::name`                           | fn       | Optional label included in `tracing` debug events emitted on retry.                                                                                                                                                                                  |
+| `Retry::run`                            | async fn | Run a closure `Fn(u32) -> Fut` (1-based attempt counter) until it succeeds, the budget is exhausted, or the cancellation token fires. Budget exhaustion surfaces as `UtilsError::RetryExhausted` via `change_context` so the original cause is preserved. |
+| `Retry::run_if`                         | async fn | Same as `run`, but with a predicate `Fn(&UtilsReport) -> bool` that decides which errors are retryable. Non-retryable errors are returned unchanged so callers can match on their original context.                                                |
 
 `WorkerPool` vs. `Throttle`: the pool runs *every* submitted job and paces
 by slot availability, while the throttle deliberately drops calls to
 enforce "at most one per interval". For paced-but-not-dropped requests
 against an HTTP endpoint, use `RateLimitedClient` instead.
+
+`Retry` vs. `Supervisor` vs. `network::RetryingClient`:
+
+- `Retry` is the bare "try this thing N times" combinator for one-shot
+  async operations. Use it when you have a closure that returns a
+  `UtilsResult<T>` and want exponential-backoff + jitter retries.
+- `Supervisor` is for long-running services that must be kept alive:
+  it spawns the supervised future on its own task to catch panics,
+  resets its consecutive-restart counter on healthy runs, and supports
+  a rolling restart window. It is **not** a one-shot retry loop.
+- `network::RetryingClient` is HTTP-specific: it understands
+  `Retry-After` headers, idempotency rules, and clones the
+  `reqwest::Request` per attempt.
 
 Example — bounded fan-out:
 
@@ -360,6 +382,32 @@ controller.trigger_on_signal();
 // A timeout surfaces as `UtilsError::Concurrency` with the count of
 // still-running tasks attached.
 controller.shutdown(Duration::from_secs(30)).await?;
+# Ok(())
+# }
+```
+
+Example — generic retry with full jitter:
+
+```rust,no_run
+use std::num::NonZeroU32;
+use std::time::Duration;
+use rust_utils::concurrency::Retry;
+use rust_utils::error::{UtilsError, UtilsResult};
+
+# async fn fetch_state() -> UtilsResult<u32> { Ok(0) }
+# async fn run() -> UtilsResult<()> {
+let value: u32 = Retry::new()
+    .max_attempts(NonZeroU32::new(5).unwrap())
+    .base_backoff(Duration::from_millis(100))
+    .max_backoff(Duration::from_secs(5))
+    .run_if(
+        |_attempt| async { fetch_state().await },
+        // Only retry transient transport failures; surface anything
+        // else (e.g. UtilsError::Config) immediately.
+        |report| matches!(report.current_context(), UtilsError::Network),
+    )
+    .await?;
+# let _ = value;
 # Ok(())
 # }
 ```
