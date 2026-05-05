@@ -4,7 +4,7 @@
 //! `reqwest`, governed by the `governor` crate (GCRA algorithm).
 
 mod client;
-mod rate_limit;
+pub(crate) mod rate_limit;
 mod retry;
 
 pub mod nats;

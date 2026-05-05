@@ -275,6 +275,16 @@ Concurrency utilities built on top of the `tokio` runtime.
 | `Throttle::try_run`         | async fn | Run the supplied closure if the window allows it and return `Some(result)`; otherwise return `None` without invoking the closure.                                                               |
 | `Throttle::reset`           | fn       | Forget the last-run timestamp; the next call runs immediately.                                                                                                                                  |
 | `Throttle::min_interval`    | fn       | Accessor for the configured window.                                                                                                                                                             |
+| `RateLimiter`                           | struct   | Protocol-agnostic, single-bucket GCRA rate limiter on top of `governor`. `Clone`-cheap; clones share the same bucket. Paces *any* async closure, not just HTTP. Use it when `RateLimitedClient` would force you to invent a fake `reqwest::Request`.            |
+| `RateLimiter::new`                      | fn       | Build from a `RateLimitWindow` and optional burst. Returns `UtilsResult<Self>`; a zero-length `Custom { period }` surfaces as `UtilsError::Config`.                                                                                                              |
+| `RateLimiter::wait_for_slot`            | async fn | Block until the bucket releases a slot.                                                                                                                                                                                                                          |
+| `RateLimiter::run`                      | async fn | Wait for a slot, then invoke the closure once and return its output. The cap is on *attempts* — if the closure's future runs longer than the replenishment period, more than one closure can be in flight at once.                                              |
+| `KeyedRateLimiter<K>`                   | struct   | Same as `RateLimiter` but keyed: each distinct `K` gets an independent bucket. Stack on top of a `RateLimiter` to enforce a global ceiling on top of per-key pacing (acquire the per-key slot first to avoid burning a global cell on a call that is going to wait anyway). `K: Clone + Eq + Hash + Send + Sync + 'static`. |
+| `KeyedRateLimiter::new`                 | fn       | Same construction surface and error semantics as `RateLimiter::new`. Window/burst apply *per key*.                                                                                                                                                               |
+| `KeyedRateLimiter::wait_for_slot`       | async fn | Wait on the bucket associated with `key`.                                                                                                                                                                                                                        |
+| `KeyedRateLimiter::run`                 | async fn | Wait on `key`'s bucket, then invoke the closure.                                                                                                                                                                                                                 |
+| `KeyedRateLimiter::retain_recent` / `shrink_to_fit` | fn | Drop buckets whose state is indistinguishable from "fresh" and reclaim memory. Long-running services that ingest unbounded keys should call these periodically — keyed limiters never automatically forget keys.                                       |
+| `KeyedRateLimiter::len` / `is_empty`    | fn       | Number of live keys (approximate depending on the state store) and emptiness check. For metrics/tests, not scheduling.                                                                                                                                            |
 | `ShutdownController`                    | struct   | Graceful-shutdown coordinator that bundles a `tokio_util::sync::CancellationToken` with a `tokio_util::task::TaskTracker`. `Clone`-cheap (both primitives are refcounted); every clone shares the same cancellation state and contributes to the same task set. |
 | `ShutdownController::new` / `default`   | fn       | Build a fresh controller with an un-cancelled token and an empty tracker.                                                                                                                       |
 | `ShutdownController::token`             | fn       | Clone of the internal `CancellationToken` — hand it to workers so they can `select!` on `token.cancelled()`.                                                                                    |
@@ -305,10 +315,19 @@ Concurrency utilities built on top of the `tokio` runtime.
 | `Retry::run`                            | async fn | Run a closure `Fn(u32) -> Fut` (1-based attempt counter) until it succeeds, the budget is exhausted, or the cancellation token fires. Budget exhaustion surfaces as `UtilsError::RetryExhausted` via `change_context` so the original cause is preserved. |
 | `Retry::run_if`                         | async fn | Same as `run`, but with a predicate `Fn(&UtilsReport) -> bool` that decides which errors are retryable. Non-retryable errors are returned unchanged so callers can match on their original context.                                                |
 
-`WorkerPool` vs. `Throttle`: the pool runs *every* submitted job and paces
-by slot availability, while the throttle deliberately drops calls to
-enforce "at most one per interval". For paced-but-not-dropped requests
-against an HTTP endpoint, use `RateLimitedClient` instead.
+`WorkerPool` vs. `Throttle` vs. `RateLimiter`:
+
+- `WorkerPool` runs *every* submitted job and paces by slot
+  availability — caps in-flight concurrency, not arrival rate.
+- `Throttle` deliberately *drops* calls to enforce "at most one per
+  interval".
+- `RateLimiter` / `KeyedRateLimiter` *queue* calls and release them
+  paced by a refilling token bucket — every call eventually runs.
+  Use `RateLimitedClient` when the unit of work is exactly a
+  `reqwest::Request`; reach for `RateLimiter` when you need the same
+  pacing on something else (a database write, a NATS publish, a
+  third-party SDK call). `KeyedRateLimiter` adds independent buckets
+  per key (per chat-id, per tenant, per user, …).
 
 `Retry` vs. `Supervisor` vs. `network::RetryingClient`:
 
@@ -348,6 +367,37 @@ use rust_utils::concurrency::Throttle;
 let throttle = Throttle::new(Duration::from_millis(500));
 assert!(throttle.try_run(|| async { 1 }).await.is_some()); // runs
 assert!(throttle.try_run(|| async { 2 }).await.is_none()); // dropped
+```
+
+Example — global + per-key rate limiting on an arbitrary async call:
+
+```rust,no_run
+use std::num::NonZeroU32;
+use std::sync::Arc;
+use rust_utils::concurrency::{KeyedRateLimiter, RateLimiter};
+use rust_utils::network::RateLimitWindow;
+
+# async fn send(_chat: i64, _text: &str) -> rust_utils::UtilsResult<()> { Ok(()) }
+# async fn run() -> rust_utils::UtilsResult<()> {
+// 30 calls/s overall, plus 1 call/s per chat.
+let global = Arc::new(RateLimiter::new(
+    RateLimitWindow::PerSecond(NonZeroU32::new(30).unwrap()),
+    None,
+)?);
+let per_chat = Arc::new(KeyedRateLimiter::<i64>::new(
+    RateLimitWindow::PerSecond(NonZeroU32::new(1).unwrap()),
+    None,
+)?);
+
+let chat_id: i64 = 42;
+// Acquire the narrower per-chat slot first so a global cell is not
+// burned on a call that is already waiting on the per-chat bucket.
+per_chat
+    .run(&chat_id, || async {
+        global.run(|| send(chat_id, "hello")).await
+    })
+    .await?;
+# Ok(()) }
 ```
 
 Example — graceful shutdown:

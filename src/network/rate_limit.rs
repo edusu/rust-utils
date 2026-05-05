@@ -1,6 +1,11 @@
 use std::num::NonZeroU32;
 use std::time::Duration;
 
+use error_stack::Report;
+use governor::Quota;
+
+use crate::error::{UtilsError, UtilsResult};
+
 /// Time window used to express a rate limit.
 ///
 /// A window specifies how many cells (requests) are replenished over a
@@ -57,4 +62,34 @@ impl RateLimitWindow {
             _ => None,
         }
     }
+}
+
+/// Translate a [`RateLimitWindow`] (and optional burst) into the
+/// [`governor::Quota`] used to construct any in-crate rate limiter.
+///
+/// Centralising this conversion keeps the validation rules — namely
+/// the rejection of zero-length custom periods — consistent across
+/// every limiter we build (`RateLimitedClient`, `RateLimiter`,
+/// `KeyedRateLimiter`).
+///
+/// # Errors
+/// Returns [`UtilsError::Config`] when `window` is
+/// [`RateLimitWindow::Custom`] with a zero-length duration.
+pub(crate) fn quota_from_window(
+    window: RateLimitWindow,
+    burst: Option<NonZeroU32>,
+) -> UtilsResult<Quota> {
+    // Translate the high-level window into a `governor::Quota`.
+    // `with_period` is the only path that can fail (period == 0).
+    let mut quota = match window {
+        RateLimitWindow::PerSecond(allowed) => Quota::per_second(allowed),
+        RateLimitWindow::PerMinute(allowed) => Quota::per_minute(allowed),
+        RateLimitWindow::Custom { period } => Quota::with_period(period).ok_or_else(|| {
+            Report::new(UtilsError::Config).attach("rate limit period must be non-zero")
+        })?,
+    };
+    if let Some(b) = burst {
+        quota = quota.allow_burst(b);
+    }
+    Ok(quota)
 }

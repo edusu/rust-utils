@@ -5,10 +5,10 @@ use error_stack::Report;
 use governor::clock::DefaultClock;
 use governor::middleware::NoOpMiddleware;
 use governor::state::{InMemoryState, NotKeyed};
-use governor::{Quota, RateLimiter};
+use governor::RateLimiter;
 use reqwest::{Client as ReqwestClient, Request, Response};
 
-use super::rate_limit::RateLimitWindow;
+use super::rate_limit::{quota_from_window, RateLimitWindow};
 use crate::error::{UtilsError, UtilsResult};
 
 /// Concrete type of the in-memory, direct, non-keyed limiter used here.
@@ -101,19 +101,7 @@ impl RateLimitedClient {
         window: RateLimitWindow,
         burst: Option<NonZeroU32>,
     ) -> UtilsResult<Self> {
-        // Translate the high-level window into a `governor::Quota`.
-        // `with_period` is the only path that can fail (period == 0).
-        let mut quota = match window {
-            RateLimitWindow::PerSecond(allowed) => Quota::per_second(allowed),
-            RateLimitWindow::PerMinute(allowed) => Quota::per_minute(allowed),
-            RateLimitWindow::Custom { period } => Quota::with_period(period).ok_or_else(|| {
-                Report::new(UtilsError::Config)
-                    .attach("rate limit period must be non-zero")
-            })?,
-        };
-        if let Some(b) = burst {
-            quota = quota.allow_burst(b);
-        }
+        let quota = quota_from_window(window, burst)?;
         Ok(Self {
             inner,
             limiter: Arc::new(RateLimiter::direct(quota)),
